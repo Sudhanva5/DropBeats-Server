@@ -106,6 +106,14 @@ class ConnectionManager:
 app = FastAPI(title="DropBeat Music API")
 manager = ConnectionManager()
 
+@app.get("/")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "DropBeat Music API",
+        "version": "1.0.0"
+    }
+
 # Enable CORS with environment configuration
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(

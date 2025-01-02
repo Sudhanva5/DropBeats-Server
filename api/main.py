@@ -20,6 +20,14 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Cache configuration
+cache: Dict[str, tuple[List, float]] = {}
+CACHE_DURATION = int(os.getenv("SEARCH_CACHE_DURATION", 3600))  # 1 hour default
+
+# Add after cache configuration
+playlist_cache: Dict[str, tuple[dict, float]] = {}
+PLAYLIST_CACHE_DURATION = int(os.getenv("PLAYLIST_CACHE_DURATION", 300))  # 5 minutes default
+
 class ClientType(Enum):
     MACOS_APP = "macos_app"
     CHROME_EXTENSION = "chrome_extension"
@@ -175,13 +183,20 @@ async def websocket_endpoint(websocket: WebSocket):
                     manager.update_pong(websocket)
                 
                 elif data["type"] == "SEARCH":
-                    query = data["query"]
-                    logger.info(f"🔍 [{id(websocket)}] Processing search request: {query}")
-                    results = await search(query)
-                    await websocket.send_json({
-                        "type": "SEARCH_RESULTS",
-                        "data": results
-                    })
+                    try:
+                        query = data["query"]
+                        logger.info(f"🔍 [{id(websocket)}] Processing search request: {query}")
+                        results = await search(query)
+                        await websocket.send_json({
+                            "type": "SEARCH_RESULTS",
+                            "data": results
+                        })
+                    except Exception as e:
+                        logger.error(f"❌ Search error: {str(e)}")
+                        await websocket.send_json({
+                            "type": "ERROR",
+                            "error": str(e)
+                        })
                 
                 elif data["type"] == "COMMAND":
                     # Forward commands from macOS app to Chrome extension
@@ -239,9 +254,27 @@ async def search_endpoint(query: str):
         logger.error(f"Search error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-async def search(query: str):
+@app.get("/search/{query}")
+async def test_search(query: str, limit: int = 5):
+    """Test endpoint for search functionality"""
+    try:
+        results = await search(query, limit)
+        return results
+    except Exception as e:
+        logger.error(f"Search test failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def search(query: str, limit: Optional[int] = 20):
     try:
         logger.info(f"🔍 Starting search for: {query}")
+        
+        # Check cache
+        cache_key = f"{query}_{limit}"
+        if cache_key in cache:
+            results, timestamp = cache[cache_key]
+            if time.time() - timestamp < CACHE_DURATION:
+                logger.info(f"💾 Cache hit for query: {query}")
+                return results
         
         # Track seen IDs to avoid duplicates
         seen_ids = set()
@@ -249,8 +282,9 @@ async def search(query: str):
         
         # Search for songs
         logger.info("🎵 Performing YTMusic search...")
-        search_results = ytmusic.search(query, filter="songs", limit=50)  # Increased limit to get more results
+        search_results = ytmusic.search(query, filter="songs", limit=50)
         logger.info(f"✅ Found {len(search_results)} results")
+        logger.debug(f"Raw search results: {search_results}")
         
         for item in search_results:
             try:
@@ -259,6 +293,7 @@ async def search(query: str):
                 
                 # Skip if no video ID or if we've seen it before
                 if not video_id or video_id in seen_ids:
+                    logger.debug(f"⚠️ Skipping item: {item.get('title')} - {'duplicate' if video_id in seen_ids else 'no video ID'}")
                     continue
                 
                 seen_ids.add(video_id)
@@ -280,28 +315,51 @@ async def search(query: str):
                 # Skip if title is missing or empty
                 title = item.get("title", "").strip()
                 if not title:
+                    logger.debug(f"⚠️ Skipping item without title: {video_id}")
                     continue
                 
-                processed_results.append({
+                # Create result object with more details
+                result = {
+                    "id": video_id,
                     "title": title,
-                    "artist": " & ".join(artists) if artists else item.get("artists", [{"name": "Unknown Artist"}])[0]["name"],
-                    "duration": item.get("duration", ""),
-                    "thumbnail": thumbnail,
-                    "videoId": video_id
-                })
+                    "artist": " & ".join(artists) if artists else item.get("author", "Unknown Artist"),
+                    "thumbnailUrl": thumbnail,
+                    "type": "song",
+                    "duration": item.get("duration", "")
+                }
                 
-                # Limit to top 20 songs
-                if len(processed_results) >= 20:
+                processed_results.append(result)
+                logger.debug(f"📝 Added song: {result['title']}")
+                
+                # Limit to specified number of songs
+                if len(processed_results) >= limit:
                     break
                 
             except Exception as e:
                 logger.error(f"❌ Error formatting result: {str(e)}", exc_info=True)
                 continue
                 
+        # Add results to cache before returning
+        cache[cache_key] = (processed_results, time.time())
         return processed_results
     except Exception as e:
         logger.error(f"Search error: {str(e)}")
         return []
+
+@app.get("/test-ytmusic")
+async def test_ytmusic():
+    """Test if YTMusic API is working"""
+    try:
+        test_query = "test"
+        results = ytmusic.search(test_query, limit=1)
+        return {
+            "status": "ok",
+            "message": "YTMusic API is working",
+            "sample_results": results
+        }
+    except Exception as e:
+        logger.error(f"YTMusic test failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))

@@ -265,12 +265,12 @@ async def search(query: str, limit: Optional[int] = 15):
         seen_ids = set()
         song_results = []
         
-        # Search for songs only with better parameters
+        # Search with better parameters
         logger.info("🎵 Performing YTMusic search...")
         search_results = ytmusic.search(
             query=query,
             filter="songs",
-            limit=30,  # Fetch more than needed for better filtering
+            limit=50,  # Increased to get more candidates for better filtering
             ignore_spelling=False
         )
         logger.info(f"✅ Found {len(search_results)} results")
@@ -283,41 +283,55 @@ async def search(query: str, limit: Optional[int] = 15):
             
             # Exact title match gets highest priority
             if query_lower == title:
-                score += 200
+                score += 300
             elif query_lower in title:
-                score += 100
+                score += 150
             
             # Check for movie soundtrack matches
             if "from" in title.lower() and query_lower in title.lower():
-                score += 150
+                score += 200
             
             # Official artist/album matches
             if item.get("album", {}).get("name", "").lower() == query_lower:
-                score += 80
+                score += 100
             
-            # Official artist channel
+            # Official artist channel (highest authority)
             if "topic" in (item.get("author", "").lower()):
-                score += 50
+                score += 250  # Increased because official channels usually have the most relevant content
             
             # Verified artists
             if item.get("isVerified", False):
-                score += 30
+                score += 100
             
-            # Duration bonus for typical song length (2-7 minutes)
+            # Duration penalty for very short or long videos (likely not songs)
             duration = item.get("duration", "")
             if duration:
                 duration_parts = duration.split(":")
                 if len(duration_parts) >= 2:
                     minutes = int(duration_parts[-2])
-                    if 2 <= minutes <= 7:
-                        score += 20
+                    if minutes < 2 or minutes > 8:
+                        score -= 50
             
-            # Popularity bonus (if available)
+            # Popularity bonus (significant factor in YouTube's ranking)
             if item.get("views"):
                 try:
                     views = int(item["views"].replace(",", ""))
-                    score += min(40, views // 1000000)  # Up to 40 points for views
+                    # Logarithmic scaling for views to prevent extremely popular videos from dominating
+                    view_score = min(200, int(50 * (1 + views / 10000000)))  # Up to 200 points for views
+                    score += view_score
                 except (ValueError, AttributeError):
+                    pass
+            
+            # Recent content bonus
+            if item.get("year"):
+                try:
+                    year = int(item["year"])
+                    current_year = datetime.now().year
+                    if year == current_year:
+                        score += 50
+                    elif year == current_year - 1:
+                        score += 30
+                except (ValueError, TypeError):
                     pass
             
             return score

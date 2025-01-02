@@ -282,7 +282,12 @@ async def search(query: str, limit: Optional[int] = 20):
             results, timestamp = cache[cache_key]
             if time.time() - timestamp < CACHE_DURATION:
                 logger.info(f"💾 Cache hit for query: {query}")
-                return results
+                return {
+                    "categories": {
+                        "songs": results
+                    },
+                    "total": len(results)
+                }
         
         # Track seen IDs to avoid duplicates
         seen_ids = set()
@@ -290,7 +295,7 @@ async def search(query: str, limit: Optional[int] = 20):
         
         # Search for songs
         logger.info("🎵 Performing YTMusic search...")
-        search_results = ytmusic.search(query, filter="songs", limit=50)
+        search_results = ytmusic.search(query, limit=50)  # Increased limit to get more results
         logger.info(f"✅ Found {len(search_results)} results")
         logger.debug(f"Raw search results: {search_results}")
         
@@ -326,7 +331,7 @@ async def search(query: str, limit: Optional[int] = 20):
                     logger.debug(f"⚠️ Skipping item without title: {video_id}")
                     continue
                 
-                # Create result object with more details
+                # Create result object
                 result = {
                     "id": video_id,
                     "title": title,
@@ -348,11 +353,22 @@ async def search(query: str, limit: Optional[int] = 20):
                 continue
                 
         # Add results to cache before returning
+        final_results = {
+            "categories": {
+                "songs": processed_results
+            },
+            "total": len(processed_results)
+        }
         cache[cache_key] = (processed_results, time.time())
-        return processed_results
+        return final_results
     except Exception as e:
         logger.error(f"Search error: {str(e)}")
-        return []
+        return {
+            "categories": {
+                "songs": []
+            },
+            "total": 0
+        }
 
 @app.get("/test-ytmusic")
 async def test_ytmusic():

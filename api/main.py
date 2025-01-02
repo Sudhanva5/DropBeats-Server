@@ -164,7 +164,7 @@ async def test_ytmusic():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/search/{query}")
-async def test_search(query: str, limit: int = 5):
+async def test_search(query: str, limit: Optional[int] = None):
     """Test endpoint for search functionality"""
     try:
         results = await search(query, limit)
@@ -278,10 +278,22 @@ async def search(query: str, limit: Optional[int] = 15):
         # Helper function to score results
         def score_result(item):
             score = 0
+            title = item.get("title", "").lower()
+            query_lower = query.lower()
             
             # Exact title match gets highest priority
-            if query.lower() in item.get("title", "").lower():
+            if query_lower == title:
+                score += 200
+            elif query_lower in title:
                 score += 100
+            
+            # Check for movie soundtrack matches
+            if "from" in title.lower() and query_lower in title.lower():
+                score += 150
+            
+            # Official artist/album matches
+            if item.get("album", {}).get("name", "").lower() == query_lower:
+                score += 80
             
             # Official artist channel
             if "topic" in (item.get("author", "").lower()):
@@ -291,14 +303,22 @@ async def search(query: str, limit: Optional[int] = 15):
             if item.get("isVerified", False):
                 score += 30
             
-            # Duration bonus for typical song length (3-5 minutes)
+            # Duration bonus for typical song length (2-7 minutes)
             duration = item.get("duration", "")
             if duration:
                 duration_parts = duration.split(":")
                 if len(duration_parts) >= 2:
                     minutes = int(duration_parts[-2])
-                    if 3 <= minutes <= 5:
+                    if 2 <= minutes <= 7:
                         score += 20
+            
+            # Popularity bonus (if available)
+            if item.get("views"):
+                try:
+                    views = int(item["views"].replace(",", ""))
+                    score += min(40, views // 1000000)  # Up to 40 points for views
+                except (ValueError, AttributeError):
+                    pass
             
             return score
         
@@ -320,11 +340,10 @@ async def search(query: str, limit: Optional[int] = 15):
                 category = item.get("category", "").lower()
                 item_type = str(item.get("type", "")).lower()
                 
-                # Skip non-songs and covers/remixes
+                # Skip non-songs (but allow movie soundtracks)
                 title = item.get("title", "").strip().lower()
-                if (category != "songs" and "song" not in item_type) or \
-                   "remix" in title or "cover" in title:
-                    logger.debug(f"⚠️ Skipping non-song or remix/cover: {video_id}")
+                if (category != "songs" and "song" not in item_type) and "from" not in title:
+                    logger.debug(f"⚠️ Skipping non-song: {video_id}")
                     continue
                 
                 # Get artists with better handling
@@ -367,7 +386,8 @@ async def search(query: str, limit: Optional[int] = 15):
 
         # Sort by score and take top results
         scored_results.sort(key=lambda x: x[0], reverse=True)
-        song_results = [result for score, result in scored_results[:limit]]
+        final_limit = limit if limit is not None else 15
+        song_results = [result for score, result in scored_results[:final_limit]]
         
         logger.info(f"Found {len(song_results)} high-quality songs")
 

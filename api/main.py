@@ -123,7 +123,10 @@ async def health_check():
     }
 
 # Enable CORS with environment configuration
-allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+allowed_origins = [
+    "chrome-extension://ilkmijnlleiedfhahbipelablnbagaoc",  # Chrome extension ID
+    "*"  # Allow all other origins for development
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,

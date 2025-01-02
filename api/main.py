@@ -227,6 +227,50 @@ async def startup_event():
     # Start the ping loop
     asyncio.create_task(manager.start_ping_loop())
 
+@app.get("/search")
+async def search_endpoint(query: str):
+    try:
+        results = ytmusic.search(query, filter="songs", limit=10)
+        processed_results = []
+        
+        for result in results:
+            if result["resultType"] == "song":
+                processed_results.append({
+                    "title": result["title"],
+                    "artist": result["artists"][0]["name"] if result["artists"] else "Unknown Artist",
+                    "duration": result["duration"],
+                    "thumbnail": result["thumbnails"][-1]["url"] if result["thumbnails"] else None,
+                    "videoId": result["videoId"]
+                })
+                
+        return {
+            "type": "SEARCH_RESULTS",
+            "data": processed_results
+        }
+    except Exception as e:
+        logger.error(f"Search error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def search(query: str):
+    try:
+        results = ytmusic.search(query, filter="songs", limit=10)
+        processed_results = []
+        
+        for result in results:
+            if result["resultType"] == "song":
+                processed_results.append({
+                    "title": result["title"],
+                    "artist": result["artists"][0]["name"] if result["artists"] else "Unknown Artist",
+                    "duration": result["duration"],
+                    "thumbnail": result["thumbnails"][-1]["url"] if result["thumbnails"] else None,
+                    "videoId": result["videoId"]
+                })
+                
+        return processed_results
+    except Exception as e:
+        logger.error(f"Search error: {str(e)}")
+        return []
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port) 

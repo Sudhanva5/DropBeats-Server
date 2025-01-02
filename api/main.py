@@ -230,22 +230,10 @@ async def startup_event():
 @app.get("/search")
 async def search_endpoint(query: str):
     try:
-        results = ytmusic.search(query, filter="songs", limit=10)
-        processed_results = []
-        
-        for result in results:
-            if result["resultType"] == "song":
-                processed_results.append({
-                    "title": result["title"],
-                    "artist": result["artists"][0]["name"] if result["artists"] else "Unknown Artist",
-                    "duration": result["duration"],
-                    "thumbnail": result["thumbnails"][-1]["url"] if result["thumbnails"] else None,
-                    "videoId": result["videoId"]
-                })
-                
+        results = await search(query)
         return {
             "type": "SEARCH_RESULTS",
-            "data": processed_results
+            "data": results
         }
     except Exception as e:
         logger.error(f"Search error: {str(e)}")
@@ -253,18 +241,62 @@ async def search_endpoint(query: str):
 
 async def search(query: str):
     try:
-        results = ytmusic.search(query, filter="songs", limit=10)
+        logger.info(f"🔍 Starting search for: {query}")
+        
+        # Track seen IDs to avoid duplicates
+        seen_ids = set()
         processed_results = []
         
-        for result in results:
-            if result["resultType"] == "song":
+        # Search for songs
+        logger.info("🎵 Performing YTMusic search...")
+        search_results = ytmusic.search(query, filter="songs", limit=50)  # Increased limit to get more results
+        logger.info(f"✅ Found {len(search_results)} results")
+        
+        for item in search_results:
+            try:
+                # Get and validate ID
+                video_id = item.get("videoId")
+                
+                # Skip if no video ID or if we've seen it before
+                if not video_id or video_id in seen_ids:
+                    continue
+                
+                seen_ids.add(video_id)
+                
+                # Get artists
+                artists = []
+                if item.get("artists"):
+                    for artist in item["artists"]:
+                        if isinstance(artist, dict) and artist.get("name"):
+                            artists.append(artist["name"])
+                
+                # Get thumbnail
+                thumbnail = None
+                if item.get("thumbnails"):
+                    thumbnails = item["thumbnails"]
+                    if thumbnails:
+                        thumbnail = thumbnails[-1]["url"]
+                
+                # Skip if title is missing or empty
+                title = item.get("title", "").strip()
+                if not title:
+                    continue
+                
                 processed_results.append({
-                    "title": result["title"],
-                    "artist": result["artists"][0]["name"] if result["artists"] else "Unknown Artist",
-                    "duration": result["duration"],
-                    "thumbnail": result["thumbnails"][-1]["url"] if result["thumbnails"] else None,
-                    "videoId": result["videoId"]
+                    "title": title,
+                    "artist": " & ".join(artists) if artists else item.get("artists", [{"name": "Unknown Artist"}])[0]["name"],
+                    "duration": item.get("duration", ""),
+                    "thumbnail": thumbnail,
+                    "videoId": video_id
                 })
+                
+                # Limit to top 20 songs
+                if len(processed_results) >= 20:
+                    break
+                
+            except Exception as e:
+                logger.error(f"❌ Error formatting result: {str(e)}", exc_info=True)
+                continue
                 
         return processed_results
     except Exception as e:

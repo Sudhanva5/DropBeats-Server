@@ -123,10 +123,7 @@ async def health_check():
     }
 
 # Enable CORS with environment configuration
-allowed_origins = [
-    "chrome-extension://ilkmijnlleiedfhahbipelablnbagaoc",  # Chrome extension ID
-    "*"  # Allow all other origins for development
-]
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -262,7 +259,15 @@ async def test_search(query: str, limit: int = 5):
     """Test endpoint for search functionality"""
     try:
         results = await search(query, limit)
-        return results
+        return {
+            "type": "SEARCH_RESULTS",
+            "data": {
+                "categories": {
+                    "songs": results
+                },
+                "total": len(results)
+            }
+        }
     except Exception as e:
         logger.error(f"Search test failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

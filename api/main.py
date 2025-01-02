@@ -249,7 +249,7 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         await manager.handle_disconnection(websocket)
 
-async def search(query: str, limit: Optional[int] = 20):
+async def search(query: str, limit: Optional[int] = 15):
     try:
         logger.info(f"🔍 Starting search for: {query}")
         
@@ -265,42 +265,76 @@ async def search(query: str, limit: Optional[int] = 20):
         seen_ids = set()
         song_results = []
         
-        # Search for songs
+        # Search for songs only with better parameters
         logger.info("🎵 Performing YTMusic search...")
-        search_results = ytmusic.search(query, limit=50)  # Increased limit to get more results
+        search_results = ytmusic.search(
+            query=query,
+            filter="songs",
+            limit=30,  # Fetch more than needed for better filtering
+            ignore_spelling=False
+        )
         logger.info(f"✅ Found {len(search_results)} results")
-        logger.debug(f"Raw search results: {search_results}")
+        
+        # Helper function to score results
+        def score_result(item):
+            score = 0
+            
+            # Exact title match gets highest priority
+            if query.lower() in item.get("title", "").lower():
+                score += 100
+            
+            # Official artist channel
+            if "topic" in (item.get("author", "").lower()):
+                score += 50
+            
+            # Verified artists
+            if item.get("isVerified", False):
+                score += 30
+            
+            # Duration bonus for typical song length (3-5 minutes)
+            duration = item.get("duration", "")
+            if duration:
+                duration_parts = duration.split(":")
+                if len(duration_parts) >= 2:
+                    minutes = int(duration_parts[-2])
+                    if 3 <= minutes <= 5:
+                        score += 20
+            
+            return score
+        
+        scored_results = []
         
         for item in search_results:
             try:
                 # Get and validate ID
                 video_id = item.get("videoId")
                 
-                # Skip if no video ID (we only want songs)
-                if not video_id:
-                    logger.debug(f"⚠️ Skipping item without video ID: {item}")
-                    continue
-                
-                # Skip if we've seen this ID before
-                if video_id in seen_ids:
-                    logger.debug(f"⚠️ Skipping duplicate ID: {video_id}")
+                # Skip if no video ID or if we've seen it before
+                if not video_id or video_id in seen_ids:
+                    logger.debug(f"⚠️ Skipping item: {item.get('title')} - {'duplicate' if video_id in seen_ids else 'no video ID'}")
                     continue
                 
                 seen_ids.add(video_id)
                 
-                # Skip channel results
-                if item.get("resultType") == "channel":
-                    logger.debug(f"⚠️ Skipping channel result: {video_id}")
+                # Enhanced quality filtering
+                category = item.get("category", "").lower()
+                item_type = str(item.get("type", "")).lower()
+                
+                # Skip non-songs and covers/remixes
+                title = item.get("title", "").strip().lower()
+                if (category != "songs" and "song" not in item_type) or \
+                   "remix" in title or "cover" in title:
+                    logger.debug(f"⚠️ Skipping non-song or remix/cover: {video_id}")
                     continue
-                    
-                # Get artists
+                
+                # Get artists with better handling
                 artists = []
                 if item.get("artists"):
                     for artist in item["artists"]:
                         if isinstance(artist, dict) and artist.get("name"):
                             artists.append(artist["name"])
                 
-                # Get thumbnail
+                # Get high-quality thumbnail
                 thumbnail = None
                 if item.get("thumbnails"):
                     thumbnails = item["thumbnails"]
@@ -308,7 +342,6 @@ async def search(query: str, limit: Optional[int] = 20):
                         thumbnail = thumbnails[-1]["url"]
                 
                 # Skip if title is missing or empty
-                title = item.get("title", "").strip()
                 if not title:
                     logger.debug(f"⚠️ Skipping item without title: {video_id}")
                     continue
@@ -316,40 +349,31 @@ async def search(query: str, limit: Optional[int] = 20):
                 # Create result object
                 result = {
                     "id": video_id,
-                    "title": title,
+                    "title": item.get("title").strip(),
                     "artist": " & ".join(artists) if artists else item.get("author", "Unknown Artist"),
                     "thumbnailUrl": thumbnail,
                     "type": "song",
                     "duration": item.get("duration", "")
                 }
                 
-                # Add to results if it's a song (based on category or type)
-                category = item.get("category", "").lower()
-                item_type = str(item.get("type", "")).lower()
-                
-                # Debug log to see what we're getting
-                logger.debug(f"Item category: {category}, type: {item_type}, title: {title}")
-                
-                # More inclusive filtering - if it has a video ID, it's likely playable
-                if video_id:  # If it has a video ID, we can play it
-                    song_results.append(result)
-                    logger.debug(f"📝 Added song: {result['title']} (category: {category}, type: {item_type})")
-                else:
-                    logger.debug(f"⚠️ Skipping: {title} - no video ID (category: {category}, type: {item_type})")
-                
-                # Limit to top 20 songs
-                if len(song_results) >= 20:
-                    break
+                # Score the result
+                score = score_result(item)
+                scored_results.append((score, result))
+                logger.debug(f"📝 Added song: {result['title']} with score {score}")
                 
             except Exception as e:
                 logger.error(f"❌ Error formatting result: {str(e)}", exc_info=True)
                 continue
 
-        logger.info(f"Found {len(song_results)} songs")
+        # Sort by score and take top results
+        scored_results.sort(key=lambda x: x[0], reverse=True)
+        song_results = [result for score, result in scored_results[:limit]]
+        
+        logger.info(f"Found {len(song_results)} high-quality songs")
 
         # Prepare response
         response = {
-            "categories": {"songs": song_results},  # Keep structure for backward compatibility
+            "categories": {"songs": song_results},
             "cached": False,
             "total": len(song_results)
         }

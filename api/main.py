@@ -271,7 +271,7 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 25
         search_results = ytmusic.search(
             query=query,
             filter=None,  # Allow both songs and videos
-            limit=50,  # Get more candidates for better filtering
+            limit=100,  # Increased to get more candidates
             ignore_spelling=False
         )
         logger.info(f"✅ Found {len(search_results)} results")
@@ -279,7 +279,8 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 25
         # Helper function to score results
         def score_result(item):
             score = 0
-            title = item.get("title", "").lower()
+            # Safely get title, converting None to empty string
+            title = (item.get("title") or "").lower()
             query_lower = query.lower()
             
             # Exact title match gets highest priority
@@ -291,17 +292,19 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 25
             # Regional content boost
             if country != "Unknown":
                 # Boost content from user's region
-                artist_country = item.get("artist", {}).get("country", "").lower()
-                if artist_country and artist_country.lower() == country.lower():
-                    score += 150  # Significant boost for local content
+                artist_info = item.get("artist", {})
+                if isinstance(artist_info, dict):
+                    artist_country = artist_info.get("country", "").lower()
+                    if artist_country and artist_country == country.lower():
+                        score += 150  # Significant boost for local content
                 
                 # Check for regional indicators in title or description
-                description = item.get("description", "").lower()
+                description = (item.get("description") or "").lower()
                 if country.lower() in title or country.lower() in description:
                     score += 100
                 
                 # Language matching (if available)
-                content_language = item.get("language", "").lower()
+                content_language = (item.get("language") or "").lower()
                 if content_language:
                     # Map countries to common languages
                     country_language_map = {
@@ -311,41 +314,49 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 25
                         # Add more mappings as needed
                     }
                     
-                    if country.lower() in country_language_map:
-                        if content_language in country_language_map[country.lower()]:
+                    country_key = country.lower()
+                    if country_key in country_language_map:
+                        if content_language in country_language_map[country_key]:
                             score += 100  # Boost for language match
             
             # Check for movie soundtrack matches
-            if "from" in title.lower() and query_lower in title.lower():
+            if "from" in title and query_lower in title:
                 score += 200
             
-            # Official artist/album matches
-            if item.get("album", {}).get("name", "").lower() == query_lower:
-                score += 100
+            # Album matches
+            album_info = item.get("album", {})
+            if isinstance(album_info, dict):
+                album_name = (album_info.get("name") or "").lower()
+                if album_name == query_lower:
+                    score += 100
             
             # Official artist channel (highest authority)
-            if "topic" in (item.get("author", "").lower()):
-                score += 250  # Increased because official channels usually have the most relevant content
+            author = (item.get("author") or "").lower()
+            if "topic" in author:
+                score += 250
             
             # Verified artists
             if item.get("isVerified", False):
                 score += 100
             
-            # Duration penalty for very short or long videos (likely not songs)
+            # Duration penalty for very short or long videos
             duration = item.get("duration", "")
             if duration:
-                duration_parts = duration.split(":")
-                if len(duration_parts) >= 2:
-                    minutes = int(duration_parts[-2])
-                    if minutes < 2 or minutes > 8:
-                        score -= 50
-            
-            # Popularity bonus (significant factor in YouTube's ranking)
-            if item.get("views"):
                 try:
-                    views = int(item["views"].replace(",", ""))
-                    # Logarithmic scaling for views to prevent extremely popular videos from dominating
-                    view_score = min(200, int(50 * (1 + views / 10000000)))  # Up to 200 points for views
+                    duration_parts = duration.split(":")
+                    if len(duration_parts) >= 2:
+                        minutes = int(duration_parts[-2])
+                        if minutes < 2 or minutes > 8:
+                            score -= 50
+                except (ValueError, IndexError):
+                    pass
+            
+            # Popularity bonus
+            views_str = str(item.get("views") or "")
+            if views_str:
+                try:
+                    views = int(views_str.replace(",", ""))
+                    view_score = min(200, int(50 * (1 + views / 10000000)))
                     score += view_score
                 except (ValueError, AttributeError):
                     pass
@@ -367,82 +378,80 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 25
         scored_results = []
         
         for item in search_results:
+            if not item:
+                continue
+                
             try:
                 # Get and validate ID
                 video_id = item.get("videoId")
                 
                 # Skip if no video ID or if we've seen it before
                 if not video_id or video_id in seen_ids:
-                    logger.debug(f"⚠️ Skipping item: {item.get('title')} - {'duplicate' if video_id in seen_ids else 'no video ID'}")
                     continue
                 
                 seen_ids.add(video_id)
                 
-                # Enhanced quality filtering
-                category = item.get("category", "").lower()
-                item_type = str(item.get("type", "")).lower()
-                
-                # Skip non-songs (but allow movie soundtracks)
-                title = item.get("title", "").strip().lower()
-                if (category != "songs" and "song" not in item_type) and "from" not in title:
-                    logger.debug(f"⚠️ Skipping non-song: {video_id}")
+                # Get title safely
+                title = (item.get("title") or "").strip()
+                if not title:
                     continue
                 
                 # Get artists with better handling
                 artists = []
-                if item.get("artists"):
-                    for artist in item["artists"]:
+                artist_list = item.get("artists", [])
+                if isinstance(artist_list, list):
+                    for artist in artist_list:
                         if isinstance(artist, dict) and artist.get("name"):
                             artists.append(artist["name"])
                 
                 # Get high-quality thumbnail
                 thumbnail = None
-                if item.get("thumbnails"):
-                    thumbnails = item["thumbnails"]
-                    if thumbnails:
-                        thumbnail = thumbnails[-1]["url"]
-                
-                # Skip if title is missing or empty
-                if not title:
-                    logger.debug(f"⚠️ Skipping item without title: {video_id}")
-                    continue
+                thumbnails = item.get("thumbnails", [])
+                if isinstance(thumbnails, list) and thumbnails:
+                    thumbnail = thumbnails[-1].get("url")
                 
                 # Create result object
                 result = {
                     "id": video_id,
-                    "title": item.get("title").strip(),
-                    "artist": " & ".join(artists) if artists else item.get("author", "Unknown Artist"),
+                    "title": title,
+                    "artist": " & ".join(artists) if artists else (item.get("author") or "Unknown Artist"),
                     "thumbnailUrl": thumbnail,
-                    "type": "song",
+                    "type": "song" if item.get("category", "").lower() == "songs" else "video",
                     "duration": item.get("duration", "")
                 }
                 
                 # Score the result
                 score = score_result(item)
                 scored_results.append((score, result))
-                logger.debug(f"📝 Added song: {result['title']} with score {score}")
                 
             except Exception as e:
-                logger.error(f"❌ Error formatting result: {str(e)}", exc_info=True)
+                logger.error(f"❌ Error processing result: {str(e)}", exc_info=True)
                 continue
 
         # Sort by score and take top results
         scored_results.sort(key=lambda x: x[0], reverse=True)
         final_limit = limit if limit is not None else 25
-        song_results = [result for score, result in scored_results[:final_limit]]
+        results = [result for score, result in scored_results[:final_limit]]
         
-        logger.info(f"Found {len(song_results)} high-quality songs")
+        # Separate songs and videos
+        songs = [r for r in results if r["type"] == "song"]
+        videos = [r for r in results if r["type"] == "video"]
+        
+        logger.info(f"Found {len(songs)} songs and {len(videos)} videos")
 
         # Prepare response
         response = {
-            "categories": {"songs": song_results},
+            "categories": {
+                "songs": songs,
+                "videos": videos
+            },
             "cached": False,
-            "total": len(song_results)
+            "total": len(results)
         }
 
         # Cache results
         cache[cache_key] = (response, time.time())
-        logger.info(f"✅ Search completed successfully with {response['total']} songs")
+        logger.info(f"✅ Search completed successfully")
         return response
     
     except Exception as e:

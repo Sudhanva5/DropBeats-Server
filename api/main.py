@@ -293,7 +293,19 @@ async def search(query: str, country: str = "India", limit: Optional[int] = 25):
             title = item.get("title", "").lower()
             query_lower = query.lower()
             
-            # Base scoring
+            # Artist name matching (high priority)
+            artists = []
+            if item.get("artists"):
+                for artist in item["artists"]:
+                    if isinstance(artist, dict) and artist.get("name"):
+                        artist_name = artist["name"].lower()
+                        artists.append(artist_name)
+                        if query_lower == artist_name:
+                            score += 400  # Highest priority for exact artist match
+                        elif query_lower in artist_name:
+                            score += 300  # High priority for partial artist match
+            
+            # Title matching
             if query_lower == title:
                 score += 300
             elif query_lower in title:
@@ -301,48 +313,45 @@ async def search(query: str, country: str = "India", limit: Optional[int] = 25):
             
             # Videos start with a penalty
             if is_video:
-                score -= 100  # Ensure videos rank lower than songs
+                score -= 100
             
-            # Regional content boost
+            # Album matching (high visibility)
+            album_name = item.get("album", {}).get("name", "").lower()
+            if album_name:
+                if query_lower == album_name:
+                    score += 250  # Strong boost for exact album match
+                elif query_lower in album_name:
+                    score += 150  # Good boost for partial album match
+            
+            # Regional content boost (reduced for international artists)
             if country != "Unknown":
-                # Boost content from user's region
-                artist_country = item.get("artist", {}).get("country", "").lower()
-                if artist_country and artist_country.lower() == country.lower():
-                    score += 150
+                is_international_artist = any(query_lower in artist.lower() for artist in artists)
                 
-                # Check for regional indicators in title or description
-                description = item.get("description", "").lower()
-                if country.lower() in title or country.lower() in description:
-                    score += 100
-                
-                # Language matching (if available)
-                content_language = item.get("language", "").lower()
-                if content_language:
-                    country_language_map = {
-                        "india": ["hindi", "tamil", "telugu", "kannada", "malayalam"],
-                        "japan": ["japanese"],
-                        "korea": ["korean"],
-                    }
+                if not is_international_artist:
+                    # Apply regional boosts only for non-international artists
+                    artist_country = item.get("artist", {}).get("country", "").lower()
+                    if artist_country and artist_country.lower() == country.lower():
+                        score += 100  # Reduced from 150
                     
-                    if country.lower() in country_language_map:
-                        if content_language in country_language_map[country.lower()]:
-                            score += 100
+                    content_language = item.get("language", "").lower()
+                    if content_language:
+                        country_language_map = {
+                            "india": ["hindi", "tamil", "telugu", "kannada", "malayalam"],
+                            "japan": ["japanese"],
+                            "korea": ["korean"],
+                        }
+                        
+                        if country.lower() in country_language_map:
+                            if content_language in country_language_map[country.lower()]:
+                                score += 75  # Reduced from 100
             
-            # Check for movie soundtrack matches
-            if "from" in title.lower() and query_lower in title.lower():
-                score += 200
-            
-            # Official artist/album matches
-            if item.get("album", {}).get("name", "").lower() == query_lower:
-                score += 100
-            
-            # Official artist channel (highest authority)
+            # Official artist/channel verification (increased importance)
             if "topic" in (item.get("author", "").lower()):
-                score += 250
+                score += 300  # Increased from 250
             
-            # Verified artists
+            # Verified artists (increased importance)
             if item.get("isVerified", False):
-                score += 100
+                score += 150  # Increased from 100
             
             # Duration penalty for very short or long content
             duration = item.get("duration", "")
@@ -353,11 +362,11 @@ async def search(query: str, country: str = "India", limit: Optional[int] = 25):
                     if minutes < 2 or minutes > 8:
                         score -= 50
             
-            # Popularity bonus
+            # Popularity bonus (increased weight)
             if item.get("views"):
                 try:
                     views = int(item["views"].replace(",", ""))
-                    view_score = min(200, int(50 * (1 + views / 10000000)))
+                    view_score = min(300, int(75 * (1 + views / 10000000)))  # Increased from 200/50
                     score += view_score
                 except (ValueError, AttributeError):
                     pass

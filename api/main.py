@@ -250,7 +250,7 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         await manager.handle_disconnection(websocket)
 
-async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15):
+async def search(query: str, country: str = "Unknown", limit: Optional[int] = 25):
     try:
         logger.info(f"🔍 Starting search for: {query} (Country: {country})")
         
@@ -264,14 +264,14 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15
 
         # Track seen IDs to avoid duplicates
         seen_ids = set()
-        song_results = []
+        results = []
         
         # Search with better parameters
         logger.info("🎵 Performing YTMusic search...")
         search_results = ytmusic.search(
             query=query,
-            filter="songs",
-            limit=50,  # Increased to get more candidates for better filtering
+            filter=None,  # Allow both songs and videos
+            limit=50,  # Get more candidates for better filtering
             ignore_spelling=False
         )
         logger.info(f"✅ Found {len(search_results)} results")
@@ -428,7 +428,7 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15
 
         # Sort by score and take top results
         scored_results.sort(key=lambda x: x[0], reverse=True)
-        final_limit = limit if limit is not None else 15
+        final_limit = limit if limit is not None else 25
         song_results = [result for score, result in scored_results[:final_limit]]
         
         logger.info(f"Found {len(song_results)} high-quality songs")

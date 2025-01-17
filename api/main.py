@@ -250,7 +250,7 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         await manager.handle_disconnection(websocket)
 
-async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15):
+async def search(query: str, country: str = "India", limit: Optional[int] = 25):
     try:
         logger.info(f"🔍 Starting search for: {query} (Country: {country})")
         
@@ -265,35 +265,50 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15
         # Track seen IDs to avoid duplicates
         seen_ids = set()
         song_results = []
+        video_results = []
         
-        # Search with better parameters
-        logger.info("🎵 Performing YTMusic search...")
-        search_results = ytmusic.search(
+        # Search for songs
+        logger.info("🎵 Performing YTMusic song search...")
+        song_search_results = ytmusic.search(
             query=query,
             filter="songs",
             limit=50,  # Increased to get more candidates for better filtering
             ignore_spelling=False
         )
-        logger.info(f"✅ Found {len(search_results)} results")
+        
+        # Search for videos
+        logger.info("🎥 Performing YTMusic video search...")
+        video_search_results = ytmusic.search(
+            query=query,
+            filter="videos",
+            limit=25,  # Fewer videos since they're lower priority
+            ignore_spelling=False
+        )
+        
+        logger.info(f"✅ Found {len(song_search_results)} songs and {len(video_search_results)} videos")
         
         # Helper function to score results
-        def score_result(item):
+        def score_result(item, is_video=False):
             score = 0
             title = item.get("title", "").lower()
             query_lower = query.lower()
             
-            # Exact title match gets highest priority
+            # Base scoring
             if query_lower == title:
                 score += 300
             elif query_lower in title:
                 score += 150
+            
+            # Videos start with a penalty
+            if is_video:
+                score -= 100  # Ensure videos rank lower than songs
             
             # Regional content boost
             if country != "Unknown":
                 # Boost content from user's region
                 artist_country = item.get("artist", {}).get("country", "").lower()
                 if artist_country and artist_country.lower() == country.lower():
-                    score += 150  # Significant boost for local content
+                    score += 150
                 
                 # Check for regional indicators in title or description
                 description = item.get("description", "").lower()
@@ -303,17 +318,15 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15
                 # Language matching (if available)
                 content_language = item.get("language", "").lower()
                 if content_language:
-                    # Map countries to common languages
                     country_language_map = {
                         "india": ["hindi", "tamil", "telugu", "kannada", "malayalam"],
                         "japan": ["japanese"],
                         "korea": ["korean"],
-                        # Add more mappings as needed
                     }
                     
                     if country.lower() in country_language_map:
                         if content_language in country_language_map[country.lower()]:
-                            score += 100  # Boost for language match
+                            score += 100
             
             # Check for movie soundtrack matches
             if "from" in title.lower() and query_lower in title.lower():
@@ -325,13 +338,13 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15
             
             # Official artist channel (highest authority)
             if "topic" in (item.get("author", "").lower()):
-                score += 250  # Increased because official channels usually have the most relevant content
+                score += 250
             
             # Verified artists
             if item.get("isVerified", False):
                 score += 100
             
-            # Duration penalty for very short or long videos (likely not songs)
+            # Duration penalty for very short or long content
             duration = item.get("duration", "")
             if duration:
                 duration_parts = duration.split(":")
@@ -340,12 +353,11 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15
                     if minutes < 2 or minutes > 8:
                         score -= 50
             
-            # Popularity bonus (significant factor in YouTube's ranking)
+            # Popularity bonus
             if item.get("views"):
                 try:
                     views = int(item["views"].replace(",", ""))
-                    # Logarithmic scaling for views to prevent extremely popular videos from dominating
-                    view_score = min(200, int(50 * (1 + views / 10000000)))  # Up to 200 points for views
+                    view_score = min(200, int(50 * (1 + views / 10000000)))
                     score += view_score
                 except (ValueError, AttributeError):
                     pass
@@ -364,29 +376,17 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15
             
             return score
         
+        # Process songs and videos
         scored_results = []
         
-        for item in search_results:
+        # Process songs
+        for item in song_search_results:
             try:
-                # Get and validate ID
                 video_id = item.get("videoId")
-                
-                # Skip if no video ID or if we've seen it before
                 if not video_id or video_id in seen_ids:
-                    logger.debug(f"⚠️ Skipping item: {item.get('title')} - {'duplicate' if video_id in seen_ids else 'no video ID'}")
                     continue
                 
                 seen_ids.add(video_id)
-                
-                # Enhanced quality filtering
-                category = item.get("category", "").lower()
-                item_type = str(item.get("type", "")).lower()
-                
-                # Skip non-songs (but allow movie soundtracks)
-                title = item.get("title", "").strip().lower()
-                if (category != "songs" and "song" not in item_type) and "from" not in title:
-                    logger.debug(f"⚠️ Skipping non-song: {video_id}")
-                    continue
                 
                 # Get artists with better handling
                 artists = []
@@ -402,12 +402,6 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15
                     if thumbnails:
                         thumbnail = thumbnails[-1]["url"]
                 
-                # Skip if title is missing or empty
-                if not title:
-                    logger.debug(f"⚠️ Skipping item without title: {video_id}")
-                    continue
-                
-                # Create result object
                 result = {
                     "id": video_id,
                     "title": item.get("title").strip(),
@@ -417,32 +411,55 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15
                     "duration": item.get("duration", "")
                 }
                 
-                # Score the result
                 score = score_result(item)
                 scored_results.append((score, result))
-                logger.debug(f"📝 Added song: {result['title']} with score {score}")
                 
             except Exception as e:
-                logger.error(f"❌ Error formatting result: {str(e)}", exc_info=True)
+                logger.error(f"❌ Error formatting song result: {str(e)}", exc_info=True)
+                continue
+        
+        # Process videos
+        for item in video_search_results:
+            try:
+                video_id = item.get("videoId")
+                if not video_id or video_id in seen_ids:
+                    continue
+                
+                seen_ids.add(video_id)
+                
+                result = {
+                    "id": video_id,
+                    "title": item.get("title").strip(),
+                    "artist": item.get("author", "Unknown Artist"),
+                    "thumbnailUrl": item.get("thumbnails", [{}])[-1].get("url"),
+                    "type": "video",
+                    "duration": item.get("duration", "")
+                }
+                
+                score = score_result(item, is_video=True)
+                scored_results.append((score, result))
+                
+            except Exception as e:
+                logger.error(f"❌ Error formatting video result: {str(e)}", exc_info=True)
                 continue
 
         # Sort by score and take top results
         scored_results.sort(key=lambda x: x[0], reverse=True)
-        final_limit = limit if limit is not None else 15
-        song_results = [result for score, result in scored_results[:final_limit]]
+        final_limit = limit if limit is not None else 25
+        final_results = [result for score, result in scored_results[:final_limit]]
         
-        logger.info(f"Found {len(song_results)} high-quality songs")
+        logger.info(f"Found {len(final_results)} high-quality results")
 
         # Prepare response
         response = {
-            "categories": {"songs": song_results},
+            "categories": {"songs": final_results},
             "cached": False,
-            "total": len(song_results)
+            "total": len(final_results)
         }
 
         # Cache results
         cache[cache_key] = (response, time.time())
-        logger.info(f"✅ Search completed successfully with {response['total']} songs")
+        logger.info(f"✅ Search completed successfully with {response['total']} results")
         return response
     
     except Exception as e:

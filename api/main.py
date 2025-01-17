@@ -250,9 +250,13 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         await manager.handle_disconnection(websocket)
 
-async def search(query: str, country: str = "Unknown", limit: Optional[int] = 25):
+async def search(query: str, country: str = "India", limit: Optional[int] = 25):
     try:
         logger.info(f"🔍 Starting search for: {query} (Country: {country})")
+        
+        # Validate country parameter
+        if not country or country.lower() == "unknown":
+            country = "India"
         
         # Check cache with country
         cache_key = f"{query}_{country}_{limit}"
@@ -282,6 +286,7 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 25
             # Safely get title, converting None to empty string
             title = (item.get("title") or "").lower()
             query_lower = query.lower()
+            country_lower = country.lower()
             
             # Exact title match gets highest priority
             if query_lower == title:
@@ -290,34 +295,31 @@ async def search(query: str, country: str = "Unknown", limit: Optional[int] = 25
                 score += 150
             
             # Regional content boost
-            if country != "Unknown":
-                # Boost content from user's region
-                artist_info = item.get("artist", {})
-                if isinstance(artist_info, dict):
-                    artist_country = artist_info.get("country", "").lower()
-                    if artist_country and artist_country == country.lower():
-                        score += 150  # Significant boost for local content
+            artist_info = item.get("artist", {})
+            if isinstance(artist_info, dict):
+                artist_country = (artist_info.get("country") or "").lower()
+                if artist_country and artist_country == country_lower:
+                    score += 150  # Significant boost for local content
+            
+            # Check for regional indicators in title or description
+            description = (item.get("description") or "").lower()
+            if country_lower in title or country_lower in description:
+                score += 100
+            
+            # Language matching (if available)
+            content_language = (item.get("language") or "").lower()
+            if content_language:
+                # Map countries to common languages
+                country_language_map = {
+                    "india": ["hindi", "tamil", "telugu", "kannada", "malayalam"],
+                    "japan": ["japanese"],
+                    "korea": ["korean"],
+                    # Add more mappings as needed
+                }
                 
-                # Check for regional indicators in title or description
-                description = (item.get("description") or "").lower()
-                if country.lower() in title or country.lower() in description:
-                    score += 100
-                
-                # Language matching (if available)
-                content_language = (item.get("language") or "").lower()
-                if content_language:
-                    # Map countries to common languages
-                    country_language_map = {
-                        "india": ["hindi", "tamil", "telugu", "kannada", "malayalam"],
-                        "japan": ["japanese"],
-                        "korea": ["korean"],
-                        # Add more mappings as needed
-                    }
-                    
-                    country_key = country.lower()
-                    if country_key in country_language_map:
-                        if content_language in country_language_map[country_key]:
-                            score += 100  # Boost for language match
+                if country_lower in country_language_map:
+                    if content_language in country_language_map[country_lower]:
+                        score += 100  # Boost for language match
             
             # Check for movie soundtrack matches
             if "from" in title and query_lower in title:

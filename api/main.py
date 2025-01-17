@@ -164,10 +164,10 @@ async def test_ytmusic():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/search/{query}")
-async def test_search(query: str, limit: Optional[int] = None):
+async def test_search(query: str, country: Optional[str] = None, limit: Optional[int] = None):
     """Test endpoint for search functionality"""
     try:
-        results = await search(query, limit)
+        results = await search(query, country=country, limit=limit)
         return results
     except Exception as e:
         logger.error(f"Search test failed: {e}")
@@ -212,8 +212,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif data["type"] == "SEARCH":
                     try:
                         query = data["query"]
-                        logger.info(f"🔍 [{id(websocket)}] Processing search request: {query}")
-                        results = await search(query)
+                        country = data.get("country", "Unknown")
+                        logger.info(f"🔍 [{id(websocket)}] Processing search request: {query} (Country: {country})")
+                        results = await search(query, country=country)
                         await websocket.send_json({
                             "type": "SEARCH_RESULTS",
                             "data": results
@@ -249,12 +250,12 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         await manager.handle_disconnection(websocket)
 
-async def search(query: str, limit: Optional[int] = 15):
+async def search(query: str, country: str = "Unknown", limit: Optional[int] = 15):
     try:
-        logger.info(f"🔍 Starting search for: {query}")
+        logger.info(f"🔍 Starting search for: {query} (Country: {country})")
         
-        # Check cache
-        cache_key = f"{query}_{limit}"
+        # Check cache with country
+        cache_key = f"{query}_{country}_{limit}"
         if cache_key in cache:
             results, timestamp = cache[cache_key]
             if time.time() - timestamp < CACHE_DURATION:
@@ -286,6 +287,33 @@ async def search(query: str, limit: Optional[int] = 15):
                 score += 300
             elif query_lower in title:
                 score += 150
+            
+            # Regional content boost
+            if country != "Unknown":
+                # Boost content from user's region
+                artist_country = item.get("artist", {}).get("country", "").lower()
+                if artist_country and artist_country.lower() == country.lower():
+                    score += 150  # Significant boost for local content
+                
+                # Check for regional indicators in title or description
+                description = item.get("description", "").lower()
+                if country.lower() in title or country.lower() in description:
+                    score += 100
+                
+                # Language matching (if available)
+                content_language = item.get("language", "").lower()
+                if content_language:
+                    # Map countries to common languages
+                    country_language_map = {
+                        "india": ["hindi", "tamil", "telugu", "kannada", "malayalam"],
+                        "japan": ["japanese"],
+                        "korea": ["korean"],
+                        # Add more mappings as needed
+                    }
+                    
+                    if country.lower() in country_language_map:
+                        if content_language in country_language_map[country.lower()]:
+                            score += 100  # Boost for language match
             
             # Check for movie soundtrack matches
             if "from" in title.lower() and query_lower in title.lower():

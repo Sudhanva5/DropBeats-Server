@@ -558,6 +558,112 @@ async def get_first_playable_song(playlist_id: str):
         logger.error(f"Failed to get first playable song from playlist {playlist_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/watch-playlist/{video_id}")
+async def get_watch_playlist(video_id: str, limit: int = 25):
+    """Get YouTube Music Radio recommendations for auto-play"""
+    try:
+        logger.info(f"🎵 Fetching watch playlist for video: {video_id}")
+
+        # Get watch playlist from ytmusicapi (YouTube Music Radio)
+        watch_playlist = ytmusic.get_watch_playlist(videoId=video_id, limit=limit)
+
+        # Parse tracks into simplified format
+        tracks = []
+        for item in watch_playlist.get('tracks', []):
+            video_id_item = item.get('videoId')
+            if not video_id_item:
+                continue
+
+            # Get artists
+            artists = []
+            if item.get('artists'):
+                for artist in item['artists']:
+                    if isinstance(artist, dict) and artist.get('name'):
+                        artists.append(artist['name'])
+
+            # Get thumbnail
+            thumbnail = None
+            if item.get('thumbnails'):
+                thumbnails = item['thumbnails']
+                if thumbnails:
+                    thumbnail = thumbnails[-1]['url']
+
+            # Parse duration to seconds
+            duration_str = item.get('duration', '0:00')
+            try:
+                parts = duration_str.split(':')
+                if len(parts) == 2:
+                    duration = int(parts[0]) * 60 + int(parts[1])
+                elif len(parts) == 3:
+                    duration = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                else:
+                    duration = 0
+            except (ValueError, IndexError):
+                duration = 0
+
+            tracks.append({
+                'id': video_id_item,
+                'title': item.get('title', '').strip(),
+                'artist': ' & '.join(artists) if artists else 'Unknown Artist',
+                'albumArt': thumbnail,
+                'duration': duration,
+                'isLiked': False,
+                'isPlaying': False,
+                'currentTime': 0
+            })
+
+        logger.info(f"✅ Found {len(tracks)} recommendations")
+        return {'tracks': tracks, 'total': len(tracks)}
+
+    except Exception as e:
+        logger.error(f"❌ Failed to get watch playlist for {video_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Watch playlist failed: {str(e)}")
+
+@app.get("/stream-url/{video_id}")
+async def get_stream_url(video_id: str):
+    """Get yt-dlp stream URL for direct playback (valid ~6 hours)"""
+    try:
+        logger.info(f"🎵 Fetching stream URL for video: {video_id}")
+
+        # Execute yt-dlp to get direct stream URL
+        youtube_url = f"https://music.youtube.com/watch?v={video_id}"
+
+        # Request M4A/MP4 audio format (AAC codec) for AVPlayer compatibility
+        result = subprocess.run(
+            ['yt-dlp', '-f', 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio', '-g', youtube_url],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            logger.error(f"❌ yt-dlp failed for {video_id}: {error_msg}")
+            raise HTTPException(status_code=500, detail=f"yt-dlp failed: {error_msg}")
+
+        stream_url = result.stdout.strip()
+
+        if not stream_url:
+            raise HTTPException(status_code=500, detail="yt-dlp returned empty stream URL")
+
+        # Stream URLs expire in approximately 6 hours
+        from datetime import timedelta
+        expires_at = datetime.now() + timedelta(hours=6)
+
+        logger.info(f"✅ Got stream URL for {video_id}")
+        return {
+            'videoId': video_id,
+            'streamUrl': stream_url,
+            'expiresAt': expires_at.isoformat()
+        }
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"❌ yt-dlp timeout for {video_id}")
+        raise HTTPException(status_code=504, detail="yt-dlp request timed out after 10 seconds")
+    except Exception as e:
+        logger.error(f"❌ Failed to get stream URL for {video_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Stream URL fetch failed: {str(e)}")
+
 @app.on_event("startup")
 async def startup_event():
     environment = os.getenv("ENVIRONMENT", "development")

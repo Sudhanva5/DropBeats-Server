@@ -6,7 +6,7 @@ nixPkgs = ["yt-dlp"]
 aptPkgs = ["python3-pip"]
 
 [phases.install]
-cmds = ["python3 -m pip install -r api/requirements.txt"]
+cmds = ["python3 -m pip install --break-system-packages -r api/requirements.txt"]
 
 [start]
 cmd = "cd api && python3 -m uvicorn main:app --host 0.0.0.0 --port $PORT"

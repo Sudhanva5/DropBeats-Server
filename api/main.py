@@ -631,7 +631,7 @@ async def get_stream_url(video_id: str):
 
         # Request M4A/MP4 audio format (AAC codec) for AVPlayer compatibility
         result = subprocess.run(
-            ['yt-dlp', '-f', 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio', '-g', youtube_url],
+            ['python3', '-m', 'yt_dlp', '-f', 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio', '-g', youtube_url],
             capture_output=True,
             text=True,
             timeout=10

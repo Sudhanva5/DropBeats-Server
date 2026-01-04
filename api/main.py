@@ -8,7 +8,6 @@ import logging
 import time
 import uvicorn
 import os
-import subprocess
 from dotenv import load_dotenv
 from enum import Enum
 from dataclasses import dataclass
@@ -620,59 +619,6 @@ async def get_watch_playlist(video_id: str, limit: int = 25):
         logger.error(f"❌ Failed to get watch playlist for {video_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Watch playlist failed: {str(e)}")
 
-@app.get("/stream-url/{video_id}")
-async def get_stream_url(video_id: str):
-    """Get yt-dlp stream URL for direct playback (valid ~6 hours)"""
-    try:
-        logger.info(f"🎵 Fetching stream URL for video: {video_id}")
-
-        # Execute yt-dlp to get direct stream URL
-        # Use regular YouTube URL (not music.youtube.com) for better compatibility
-        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-
-        # Use android_sdkless client - works without authentication/PO tokens
-        # This is part of yt-dlp's default client list specifically for server deployments
-        result = subprocess.run(
-            [
-                'python3', '-m', 'yt_dlp',
-                '-f', 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio',
-                '--extractor-args', 'youtube:player_client=android_sdkless',
-                '-g',
-                youtube_url
-            ],
-            capture_output=True,
-            text=True,
-            timeout=20
-        )
-
-        if result.returncode != 0:
-            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
-            logger.error(f"❌ yt-dlp failed for {video_id}: {error_msg}")
-            raise HTTPException(status_code=500, detail=f"yt-dlp failed: {error_msg}")
-
-        stream_url = result.stdout.strip()
-
-        if not stream_url:
-            raise HTTPException(status_code=500, detail="yt-dlp returned empty stream URL")
-
-        # Stream URLs expire in approximately 6 hours
-        from datetime import timedelta
-        expires_at = datetime.now() + timedelta(hours=6)
-
-        logger.info(f"✅ Got stream URL for {video_id}")
-        return {
-            'videoId': video_id,
-            'streamUrl': stream_url,
-            'expiresAt': expires_at.isoformat()
-        }
-
-    except subprocess.TimeoutExpired:
-        logger.error(f"❌ yt-dlp timeout for {video_id}")
-        raise HTTPException(status_code=504, detail="yt-dlp request timed out after 10 seconds")
-    except Exception as e:
-        logger.error(f"❌ Failed to get stream URL for {video_id}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Stream URL fetch failed: {str(e)}")
-
 @app.on_event("startup")
 async def startup_event():
     environment = os.getenv("ENVIRONMENT", "development")
@@ -683,15 +629,17 @@ async def startup_event():
     logger.info(f"HTTP server running on port {port}")
     logger.info(f"WebSocket server running on port {ws_port}")
     
+    # Test YTMusic connection (non-blocking)
     try:
         ytmusic.search("test", limit=1)
-        logger.info("YTMusic connection successful")
+        logger.info("✅ YTMusic connection successful")
     except Exception as e:
-        logger.error(f"YTMusic connection failed: {e}")
-        raise
+        logger.warning(f"⚠️ YTMusic connection failed: {e}")
+        logger.warning("   Search functionality may be limited, but server will continue")
     
     # Start the ping loop
     asyncio.create_task(manager.start_ping_loop())
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    port = int(os.getenv("PORT", 4002))
+    uvicorn.run(app, host="0.0.0.0", port=port) 

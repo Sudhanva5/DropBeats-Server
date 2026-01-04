@@ -627,22 +627,22 @@ async def get_stream_url(video_id: str):
         logger.info(f"🎵 Fetching stream URL for video: {video_id}")
 
         # Execute yt-dlp to get direct stream URL
-        youtube_url = f"https://music.youtube.com/watch?v={video_id}"
+        # Use regular YouTube URL (not music.youtube.com) for better compatibility
+        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        # Request M4A/MP4 audio format (AAC codec) for AVPlayer compatibility
-        # Try ios client first (best for YouTube Music), fallback to web_creator
+        # Use android_sdkless client - works without authentication/PO tokens
+        # This is part of yt-dlp's default client list specifically for server deployments
         result = subprocess.run(
             [
                 'python3', '-m', 'yt_dlp',
                 '-f', 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio',
-                '--extractor-args', 'youtube:player_client=ios,web_creator',
-                '--no-check-certificate',
+                '--extractor-args', 'youtube:player_client=android_sdkless',
                 '-g',
                 youtube_url
             ],
             capture_output=True,
             text=True,
-            timeout=15
+            timeout=20
         )
 
         if result.returncode != 0:

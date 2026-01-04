@@ -2,7 +2,7 @@
 NIXPACKS_PYTHON_VERSION = "3.11"
 
 [phases.setup]
-aptPkgs = ["python3-pip", "ffmpeg"]
+aptPkgs = ["python3-pip", "ffmpeg", "nodejs"]
 
 [phases.install]
 cmds = ["python3 -m pip install --break-system-packages -r api/requirements.txt"]

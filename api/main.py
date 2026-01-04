@@ -630,8 +630,16 @@ async def get_stream_url(video_id: str):
         youtube_url = f"https://music.youtube.com/watch?v={video_id}"
 
         # Request M4A/MP4 audio format (AAC codec) for AVPlayer compatibility
+        # Add user agent and extractor args to avoid bot detection
         result = subprocess.run(
-            ['python3', '-m', 'yt_dlp', '-f', 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio', '-g', youtube_url],
+            [
+                'python3', '-m', 'yt_dlp',
+                '-f', 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio',
+                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                '--extractor-args', 'youtube:player_client=android,web',
+                '-g',
+                youtube_url
+            ],
             capture_output=True,
             text=True,
             timeout=10

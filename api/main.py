@@ -630,12 +630,12 @@ async def get_stream_url(video_id: str):
         youtube_url = f"https://music.youtube.com/watch?v={video_id}"
 
         # Request M4A/MP4 audio format (AAC codec) for AVPlayer compatibility
-        # Use tv_embedded client - bypasses PO token requirement for bot detection
+        # Try ios client first (best for YouTube Music), fallback to web_creator
         result = subprocess.run(
             [
                 'python3', '-m', 'yt_dlp',
                 '-f', 'bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio',
-                '--extractor-args', 'youtube:player_client=tv_embedded',
+                '--extractor-args', 'youtube:player_client=ios,web_creator',
                 '--no-check-certificate',
                 '-g',
                 youtube_url

@@ -2,8 +2,7 @@
 NIXPACKS_PYTHON_VERSION = "3.11"
 
 [phases.setup]
-nixPkgs = ["yt-dlp"]
-aptPkgs = ["python3-pip"]
+aptPkgs = ["python3-pip", "ffmpeg"]
 
 [phases.install]
 cmds = ["python3 -m pip install --break-system-packages -r api/requirements.txt"]

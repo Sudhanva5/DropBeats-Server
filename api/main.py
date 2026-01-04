@@ -143,6 +143,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 @app.get("/health")
+@app.head("/health")
 async def health_check():
     """Check if the server is running"""
     return {"status": "healthy", "timestamp": time.time()}

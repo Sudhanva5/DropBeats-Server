@@ -641,8 +641,19 @@ async def startup_event():
     if LICENSING_ENABLED:
         import db
 
-        await db.init_pool()
-        logger.info("✅ Licensing enabled (database pool ready)")
+        try:
+            await db.init_pool()
+            logger.info("✅ Licensing enabled (database pool ready)")
+        except Exception as e:
+            # Deliberately non-fatal. A raised startup handler fails the ASGI
+            # lifespan and uvicorn exits, which would take /search and
+            # /watch-playlist down with it — endpoints the shipped macOS app
+            # depends on and which need no database at all. Licensing degrades
+            # on its own instead.
+            logger.error(
+                "❌ Licensing database unavailable, licensing endpoints will fail "
+                "until it recovers: %s", e, exc_info=True
+            )
     else:
         logger.info("ℹ️ Licensing disabled (no DATABASE_URL) — bundled/local mode")
     logger.info(f"HTTP server running on port {port}")

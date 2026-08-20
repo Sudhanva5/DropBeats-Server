@@ -85,10 +85,27 @@ class RateLimiter:
 _validate_limiter = RateLimiter(capacity=30, refill_per_second=0.5)
 
 
+def _client_key(request: Request) -> str:
+    """Bucket key for rate limiting.
+
+    Railway terminates TLS at an edge proxy and uvicorn runs without
+    --proxy-headers, so request.client.host is the proxy for every user.
+    Keying on that would put all customers in one bucket. X-Forwarded-For
+    is client-spoofable, which is an accepted trade-off: this limiter is a
+    courtesy guard on an endpoint whose real secret is the licence key, and
+    starving legitimate users is the worse failure.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else "unknown"
+
+
 @router.post("/license/validate", response_model=ValidateResponse)
 async def validate_license(payload: ValidateRequest, request: Request) -> ValidateResponse:
-    client_ip = request.client.host if request.client else "unknown"
-    if not _validate_limiter.allow(client_ip):
+    if not _validate_limiter.allow(_client_key(request)):
         raise HTTPException(status_code=429, detail="Too many requests")
 
     pool = db.get_pool()

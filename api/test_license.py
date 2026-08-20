@@ -380,3 +380,69 @@ def test_rate_limiter_refills_over_time():
     assert limiter.allow("1.1.1.1") is False
     clock["now"] += 2.0
     assert limiter.allow("1.1.1.1") is True
+
+
+class _FakeClient:
+    def __init__(self, host):
+        self.host = host
+
+
+class _FakeRequest:
+    """Minimal stand-in for fastapi.Request: just enough surface for
+    _client_key (headers.get and client.host)."""
+
+    def __init__(self, headers=None, client_host="9.9.9.9"):
+        self.headers = headers or {}
+        self.client = _FakeClient(client_host) if client_host is not None else None
+
+
+def test_client_key_prefers_leftmost_x_forwarded_for():
+    import license as license_module
+
+    request = _FakeRequest(
+        headers={
+            "x-forwarded-for": "203.0.113.7, 70.41.3.18, 150.172.238.178"
+        },
+        client_host="10.0.0.1",
+    )
+    assert license_module._client_key(request) == "203.0.113.7"
+
+
+def test_client_key_falls_back_to_peer_address_without_header():
+    import license as license_module
+
+    request = _FakeRequest(headers={}, client_host="10.0.0.1")
+    assert license_module._client_key(request) == "10.0.0.1"
+
+
+def test_client_key_falls_back_to_unknown_without_client_or_header():
+    import license as license_module
+
+    request = _FakeRequest(headers={}, client_host=None)
+    assert license_module._client_key(request) == "unknown"
+
+
+def test_different_x_forwarded_for_values_get_independent_buckets():
+    """Two callers behind different X-Forwarded-For values must not share a
+    bucket -- exhausting one caller's tokens must not deny the other.
+
+    Drives the same key-derivation the endpoint uses, against a small,
+    dedicated RateLimiter instance rather than the real module-level
+    _validate_limiter (capacity 30), so the test stays fast and does not
+    pollute shared state used by other tests.
+    """
+    import license as license_module
+
+    limiter = license_module.RateLimiter(capacity=1, refill_per_second=0.0)
+
+    request_a = _FakeRequest(headers={"x-forwarded-for": "1.1.1.1"})
+    request_b = _FakeRequest(headers={"x-forwarded-for": "2.2.2.2"})
+
+    key_a = license_module._client_key(request_a)
+    key_b = license_module._client_key(request_b)
+
+    assert limiter.allow(key_a) is True
+    assert limiter.allow(key_a) is False
+    # A different X-Forwarded-For value must still be allowed: its bucket is
+    # untouched by request_a's exhaustion.
+    assert limiter.allow(key_b) is True

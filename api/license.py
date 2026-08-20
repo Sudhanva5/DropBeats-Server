@@ -70,3 +70,63 @@ async def validate_license(payload: ValidateRequest) -> ValidateResponse:
             created_at=row["created_at"].isoformat(timespec="seconds"),
             has_completed_onboarding=row["has_completed_onboarding"],
         )
+
+
+class DeactivateRequest(BaseModel):
+    key: str
+    email: str
+
+
+class MutationResponse(BaseModel):
+    success: bool
+    message: str = ""
+    error: str | None = None
+
+
+class OnboardingRequest(BaseModel):
+    key: str
+    completed: bool
+
+
+@router.post("/license/deactivate", response_model=MutationResponse)
+async def deactivate_license(payload: DeactivateRequest) -> MutationResponse:
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        # Email is matched alongside the key so that possession of a key alone
+        # cannot deactivate a licence.
+        updated = await conn.fetchval(
+            """
+            update licenses
+            set is_active = false
+            where normalize_license_key(license_key) = normalize_license_key($1)
+              and lower(email) = lower($2)
+            returning id
+            """,
+            payload.key,
+            payload.email,
+        )
+
+    if updated is None:
+        return MutationResponse(success=False, error="License not found")
+    logger.info("licence deactivated: %s", updated)
+    return MutationResponse(success=True, message="License deactivated")
+
+
+@router.post("/license/onboarding", response_model=MutationResponse)
+async def update_onboarding(payload: OnboardingRequest) -> MutationResponse:
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        updated = await conn.fetchval(
+            """
+            update licenses
+            set has_completed_onboarding = $2
+            where normalize_license_key(license_key) = normalize_license_key($1)
+            returning id
+            """,
+            payload.key,
+            payload.completed,
+        )
+
+    if updated is None:
+        return MutationResponse(success=False, error="License not found")
+    return MutationResponse(success=True, message="Onboarding status updated")

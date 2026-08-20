@@ -160,3 +160,55 @@ async def test_validate_updates_last_login(client, seeded, migrated_conn):
         "select last_login from licenses where license_key = 'AAAA-BBBB'"
     )
     assert after is not None
+
+
+@pytest.mark.asyncio
+async def test_deactivate_marks_licence_inactive(client, seeded, migrated_conn):
+    r = await client.post(
+        "/license/deactivate",
+        json={"key": "AAAA-BBBB", "email": "active@example.com"},
+    )
+    assert r.status_code == 200
+    assert r.json()["success"] is True
+
+    still_active = await migrated_conn.fetchval(
+        "select is_active from licenses where license_key = 'AAAA-BBBB'"
+    )
+    assert still_active is False
+
+
+@pytest.mark.asyncio
+async def test_deactivate_requires_matching_email(client, seeded, migrated_conn):
+    """The email is the authorisation check: holding the key alone must not be
+    enough to deactivate someone else's licence."""
+    r = await client.post(
+        "/license/deactivate",
+        json={"key": "AAAA-BBBB", "email": "attacker@example.com"},
+    )
+    assert r.json()["success"] is False
+    assert r.json()["error"] == "License not found"
+
+    still_active = await migrated_conn.fetchval(
+        "select is_active from licenses where license_key = 'AAAA-BBBB'"
+    )
+    assert still_active is True
+
+
+@pytest.mark.asyncio
+async def test_onboarding_flag_round_trips(client, seeded):
+    r = await client.post(
+        "/license/onboarding", json={"key": "AAAA-BBBB", "completed": True}
+    )
+    assert r.json()["success"] is True
+
+    check = await client.post("/license/validate", json={"key": "AAAA-BBBB"})
+    assert check.json()["has_completed_onboarding"] is True
+
+
+@pytest.mark.asyncio
+async def test_onboarding_unknown_key_reports_failure(client, seeded):
+    r = await client.post(
+        "/license/onboarding", json={"key": "NOPE", "completed": True}
+    )
+    assert r.json()["success"] is False
+    assert r.json()["error"] == "License not found"

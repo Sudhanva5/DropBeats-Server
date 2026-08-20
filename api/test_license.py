@@ -82,3 +82,60 @@ async def test_init_pool_is_idempotent(migrated_conn):
     second = await db.init_pool("postgresql://localhost/dropbeats_test")
     assert first is second
     await db.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_validate_accepts_known_active_key(client, seeded):
+    r = await client.post("/license/validate", json={"key": "AAAA-BBBB"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["valid"] is True
+    assert body["name"] == "Active User"
+    assert body["email"] == "active@example.com"
+    assert body["country"] == "IN"
+    assert body["has_completed_onboarding"] is False
+    assert body["created_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_validate_rejects_unknown_key(client, seeded):
+    r = await client.post("/license/validate", json={"key": "NOPE-NOPE"})
+    assert r.status_code == 200
+    assert r.json() == {
+        "valid": False,
+        "error": "Invalid license key",
+        "name": None,
+        "email": None,
+        "country": None,
+        "created_at": None,
+        "has_completed_onboarding": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_validate_rejects_deactivated_key(client, seeded):
+    r = await client.post("/license/validate", json={"key": "CCCC-DDDD"})
+    assert r.json()["valid"] is False
+    assert r.json()["error"] == "License is not active"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["aaaa-bbbb", "AAAABBBB", "aa_aa_bbbb", "AaAa-BbBb"])
+async def test_validate_normalises_key_variants(client, seeded, variant):
+    r = await client.post("/license/validate", json={"key": variant})
+    assert r.json()["valid"] is True, f"{variant} should resolve to the same licence"
+
+
+@pytest.mark.asyncio
+async def test_validate_updates_last_login(client, seeded, migrated_conn):
+    before = await migrated_conn.fetchval(
+        "select last_login from licenses where license_key = 'AAAA-BBBB'"
+    )
+    assert before is None
+
+    await client.post("/license/validate", json={"key": "AAAA-BBBB"})
+
+    after = await migrated_conn.fetchval(
+        "select last_login from licenses where license_key = 'AAAA-BBBB'"
+    )
+    assert after is not None

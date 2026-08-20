@@ -51,3 +51,49 @@ async def migrated_conn(migrations_dir):
         yield conn
     finally:
         await conn.close()
+
+
+@pytest_asyncio.fixture
+async def client(migrated_conn, monkeypatch):
+    """An httpx client bound to a FastAPI app carrying only the licence router.
+
+    main.py is not imported: it constructs a YTMusic client at import time and
+    would make these tests depend on YouTube being reachable.
+    """
+    import httpx
+    from fastapi import FastAPI
+
+    import db
+    import license as license_module
+
+    monkeypatch.setenv("GUMROAD_SELLER_ID", "test-seller")
+    monkeypatch.setenv("GUMROAD_WEBHOOK_SECRET", "test-secret")
+
+    await db.close_pool()
+    # Connect as dropbeats_app, not as the owner. Production runs under this
+    # role, so tests that ran as owner would silently pass while a missing
+    # grant broke the deployed service.
+    await db.init_pool(APP_DSN)
+
+    app = FastAPI()
+    app.include_router(license_module.router)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as c:
+        yield c
+
+    await db.close_pool()
+
+
+@pytest_asyncio.fixture
+async def seeded(migrated_conn):
+    """One active and one deactivated licence."""
+    await migrated_conn.execute(
+        """
+        insert into licenses (email, full_name, country, license_key, sale_id, is_active)
+        values ('active@example.com', 'Active User', 'IN', 'AAAA-BBBB', 'sale_1', true),
+               ('gone@example.com',   'Gone User',   'US', 'CCCC-DDDD', 'sale_2', false)
+        """
+    )

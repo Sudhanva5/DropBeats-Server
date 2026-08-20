@@ -65,9 +65,18 @@ def quote_literal(value: str) -> str:
 
 
 async def main() -> int:
-    dsn = os.environ.get("DATABASE_URL")
+    # Migrations run as the OWNER, not as the application role. On Railway
+    # DATABASE_URL is deliberately the least-privilege dropbeats_app DSN, which
+    # owns nothing and cannot do DDL, so running migrations through it would
+    # fail. ADMIN_DATABASE_URL carries the superuser DSN. The fallback keeps
+    # local development working, where the developer is already superuser and
+    # only sets DATABASE_URL.
+    dsn = os.environ.get("ADMIN_DATABASE_URL") or os.environ.get("DATABASE_URL")
     if not dsn:
-        print("DATABASE_URL is not set", file=sys.stderr)
+        print(
+            "neither ADMIN_DATABASE_URL nor DATABASE_URL is set",
+            file=sys.stderr,
+        )
         return 1
 
     password = os.environ.get("APP_DB_PASSWORD")

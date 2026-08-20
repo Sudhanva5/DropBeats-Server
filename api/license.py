@@ -10,6 +10,9 @@ import json
 import logging
 import os
 import secrets
+import time
+from collections import defaultdict
+from typing import Callable
 
 import asyncpg
 from fastapi import APIRouter, HTTPException, Request
@@ -46,8 +49,48 @@ LOOKUP_SQL = """
 """
 
 
+class RateLimiter:
+    """Per-key token bucket.
+
+    In-process, so it protects a single instance only. If this service ever
+    runs more than one replica this needs to move to shared state.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        refill_per_second: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.capacity = capacity
+        self.refill_per_second = refill_per_second
+        self.clock = clock
+        self._buckets: dict[str, tuple[float, float]] = {}
+
+    def allow(self, key: str) -> bool:
+        now = self.clock()
+        tokens, last = self._buckets.get(key, (float(self.capacity), now))
+        tokens = min(self.capacity, tokens + (now - last) * self.refill_per_second)
+
+        if tokens < 1.0:
+            self._buckets[key] = (tokens, now)
+            return False
+
+        self._buckets[key] = (tokens - 1.0, now)
+        return True
+
+
+# 30 validations per minute per IP. The app validates once a day; anything
+# near this ceiling is not a real client.
+_validate_limiter = RateLimiter(capacity=30, refill_per_second=0.5)
+
+
 @router.post("/license/validate", response_model=ValidateResponse)
-async def validate_license(payload: ValidateRequest) -> ValidateResponse:
+async def validate_license(payload: ValidateRequest, request: Request) -> ValidateResponse:
+    client_ip = request.client.host if request.client else "unknown"
+    if not _validate_limiter.allow(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
     pool = db.get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(LOOKUP_SQL, payload.key)

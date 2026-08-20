@@ -350,3 +350,33 @@ async def test_onboarding_unknown_key_reports_failure(client, seeded):
     )
     assert r.json()["success"] is False
     assert r.json()["error"] == "License not found"
+
+
+def test_rate_limiter_allows_then_blocks():
+    import license as license_module
+
+    limiter = license_module.RateLimiter(capacity=3, refill_per_second=0.0)
+    assert [limiter.allow("1.2.3.4") for _ in range(3)] == [True, True, True]
+    assert limiter.allow("1.2.3.4") is False
+
+
+def test_rate_limiter_is_per_key():
+    import license as license_module
+
+    limiter = license_module.RateLimiter(capacity=1, refill_per_second=0.0)
+    assert limiter.allow("1.1.1.1") is True
+    assert limiter.allow("1.1.1.1") is False
+    assert limiter.allow("2.2.2.2") is True
+
+
+def test_rate_limiter_refills_over_time():
+    import license as license_module
+
+    clock = {"now": 1000.0}
+    limiter = license_module.RateLimiter(
+        capacity=1, refill_per_second=1.0, clock=lambda: clock["now"]
+    )
+    assert limiter.allow("1.1.1.1") is True
+    assert limiter.allow("1.1.1.1") is False
+    clock["now"] += 2.0
+    assert limiter.allow("1.1.1.1") is True

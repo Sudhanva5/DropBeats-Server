@@ -51,6 +51,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# The licensing router is registered only when a database is configured.
+# This same file runs bundled inside the macOS .app on port 4002, where there
+# is no database and no asyncpg — hence the import inside the branch rather
+# than at module scope.
+LICENSING_ENABLED = bool(os.getenv("DATABASE_URL"))
+
+if LICENSING_ENABLED:
+    from license import router as license_router
+
+    app.include_router(license_router)
+
 # Initialize YTMusic with environment configuration
 ytmusic_oauth = os.getenv("YTMUSIC_OAUTH_FILE", "oauth.json")
 ytmusic_headers = os.getenv("YTMUSIC_HEADERS_FILE", "headers_auth.json")
@@ -626,6 +637,14 @@ async def startup_event():
     ws_port = int(os.getenv("WS_PORT", 8089))
     
     logger.info(f"Starting DropBeat Music API in {environment} mode")
+
+    if LICENSING_ENABLED:
+        import db
+
+        await db.init_pool()
+        logger.info("✅ Licensing enabled (database pool ready)")
+    else:
+        logger.info("ℹ️ Licensing disabled (no DATABASE_URL) — bundled/local mode")
     logger.info(f"HTTP server running on port {port}")
     logger.info(f"WebSocket server running on port {ws_port}")
     
@@ -639,6 +658,13 @@ async def startup_event():
     
     # Start the ping loop
     asyncio.create_task(manager.start_ping_loop())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if LICENSING_ENABLED:
+        import db
+
+        await db.close_pool()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 4002))

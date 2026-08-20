@@ -581,15 +581,15 @@ async def get_watch_playlist(video_id: str, limit: int = 25):
                     if isinstance(artist, dict) and artist.get('name'):
                         artists.append(artist['name'])
 
-            # Get thumbnail
+            # Get thumbnail. ytmusicapi's watch parser emits 'thumbnail' (singular);
+            # 'thumbnails' is the search/browse shape. Accept either.
             thumbnail = None
-            if item.get('thumbnails'):
-                thumbnails = item['thumbnails']
-                if thumbnails:
-                    thumbnail = thumbnails[-1]['url']
+            thumbnails = item.get('thumbnail') or item.get('thumbnails')
+            if thumbnails:
+                thumbnail = thumbnails[-1]['url']
 
-            # Parse duration to seconds
-            duration_str = item.get('duration', '0:00')
+            # Parse duration to seconds. Watch parser emits 'length' (e.g. "4:18").
+            duration_str = item.get('length') or item.get('duration') or '0:00'
             try:
                 parts = duration_str.split(':')
                 if len(parts) == 2:

@@ -34,6 +34,14 @@ async def init_pool(dsn: str | None = None) -> asyncpg.Pool:
                     min_size=1,
                     max_size=5,
                     command_timeout=10,
+                    # min_size=1 means create_pool() connects eagerly, and
+                    # asyncpg's default connect timeout is 60s. Startup calls
+                    # this inside the ASGI lifespan, so a blackholed database
+                    # (a private-network DNS failure is the classic Railway
+                    # case) would stall boot for a minute against a 100s
+                    # healthcheck window. Fail fast and let lazy re-init heal
+                    # it later.
+                    timeout=5,
                 )
     return _pool
 

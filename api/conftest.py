@@ -69,6 +69,17 @@ async def client(migrated_conn, monkeypatch):
     monkeypatch.setenv("GUMROAD_SELLER_ID", "test-seller")
     monkeypatch.setenv("GUMROAD_WEBHOOK_SECRET", "test-secret")
 
+    # The limiters are module globals, so their buckets outlive a test and
+    # would otherwise leak spent tokens into whatever runs next -- a surprise
+    # 429 in an unrelated test, appearing only once the suite grows past the
+    # capacity. Every test starts with a full bucket.
+    for limiter in (
+        license_module._validate_limiter,
+        license_module._deactivate_limiter,
+        license_module._onboarding_limiter,
+    ):
+        limiter.reset()
+
     await db.close_pool()
     # Connect as dropbeats_app, not as the owner. Production runs under this
     # role, so tests that ran as owner would silently pass while a missing

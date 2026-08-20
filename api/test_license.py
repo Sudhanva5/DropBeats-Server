@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 
@@ -498,3 +500,435 @@ def test_different_x_forwarded_for_values_get_independent_buckets():
     # A different X-Forwarded-For value must still be allowed: its bucket is
     # untouched by request_a's exhaustion.
     assert limiter.allow(key_b) is True
+
+
+def test_client_key_rejects_over_long_x_forwarded_for():
+    """An attacker-chosen key must not be attacker-sized.
+
+    The header is spoofable by design, so the only thing standing between it
+    and unbounded memory growth is that a multi-kilobyte value never becomes a
+    dict key at all."""
+    import license as license_module
+
+    request = _FakeRequest(
+        headers={"x-forwarded-for": "1" * 4096},
+        client_host="10.0.0.1",
+    )
+    assert license_module._client_key(request) == "10.0.0.1"
+
+
+@pytest.mark.parametrize(
+    "forwarded",
+    [
+        "a" * 46,  # one over the IPv6 maximum
+        "not an ip",  # spaces
+        "<script>",  # arbitrary junk
+        "host.example.com",  # a name, not an address
+        "",  # empty after strip
+    ],
+)
+def test_client_key_rejects_malformed_x_forwarded_for(forwarded):
+    import license as license_module
+
+    request = _FakeRequest(
+        headers={"x-forwarded-for": forwarded}, client_host="10.0.0.1"
+    )
+    assert license_module._client_key(request) == "10.0.0.1"
+
+
+def test_client_key_accepts_ipv6_with_zone():
+    """The clamp must not reject addresses it is supposed to let through."""
+    import license as license_module
+
+    request = _FakeRequest(
+        headers={"x-forwarded-for": "2001:db8::1%1"}, client_host="10.0.0.1"
+    )
+    assert license_module._client_key(request) == "2001:db8::1%1"
+
+
+def test_client_key_falls_back_to_unknown_when_peer_is_not_an_address():
+    import license as license_module
+
+    request = _FakeRequest(
+        headers={"x-forwarded-for": "garbage value"}, client_host="/tmp/uvicorn.sock"
+    )
+    assert license_module._client_key(request) == "unknown"
+
+
+def test_rate_limiter_bucket_count_stays_bounded():
+    """Many distinct keys must not mean many retained buckets.
+
+    This is the memory exhaustion the clamp alone cannot stop: every key here
+    is perfectly well formed."""
+    import license as license_module
+
+    limiter = license_module.RateLimiter(
+        capacity=1, refill_per_second=0.0, max_buckets=10
+    )
+    for i in range(1000):
+        limiter.allow(f"10.0.{i // 256}.{i % 256}")
+
+    assert len(limiter._buckets) <= 10
+
+
+def test_rate_limiter_evicts_full_buckets_first():
+    """A bucket at capacity is indistinguishable from an unseen key, so it is
+    the safe thing to drop -- and dropping it must not change that key's
+    answer."""
+    clock = {"now": 1000.0}
+    import license as license_module
+
+    limiter = license_module.RateLimiter(
+        capacity=2,
+        refill_per_second=1.0,
+        clock=lambda: clock["now"],
+        max_buckets=3,
+    )
+
+    # "1.1.1.1" spends a token, then refills all the way back to capacity.
+    assert limiter.allow("1.1.1.1") is True
+    clock["now"] += 100.0
+
+    # Drive the limiter over its cap with keys that are mid-consumption.
+    for i in range(20):
+        limiter.allow(f"2.2.2.{i}")
+
+    assert len(limiter._buckets) <= 3
+    assert "1.1.1.1" not in limiter._buckets, "the full bucket should be evicted first"
+
+    # Evicted or not, the answer for that key is unchanged: a full bucket's
+    # worth of requests still succeeds.
+    assert limiter.allow("1.1.1.1") is True
+    assert limiter.allow("1.1.1.1") is True
+    assert limiter.allow("1.1.1.1") is False
+
+
+def test_rate_limiter_reset_clears_buckets():
+    import license as license_module
+
+    limiter = license_module.RateLimiter(capacity=1, refill_per_second=0.0)
+    assert limiter.allow("1.1.1.1") is True
+    assert limiter.allow("1.1.1.1") is False
+    limiter.reset()
+    assert limiter.allow("1.1.1.1") is True
+
+
+@pytest.mark.asyncio
+async def test_validate_is_rate_limited(client, seeded, monkeypatch):
+    """The limiter is wired into the endpoint, and exhausting it is a 429.
+
+    Without this, deleting the two lines that call the limiter leaves the
+    whole suite green.
+    """
+    import license as license_module
+
+    monkeypatch.setattr(
+        license_module,
+        "_validate_limiter",
+        license_module.RateLimiter(capacity=1, refill_per_second=0.0),
+    )
+
+    first = await client.post("/license/validate", json={"key": "AAAA-BBBB"})
+    second = await client.post("/license/validate", json={"key": "AAAA-BBBB"})
+
+    assert first.status_code == 200
+    assert first.json()["valid"] is True
+    assert second.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_onboarding_is_rate_limited(client, seeded, monkeypatch):
+    """/license/onboarding answers "does this key exist?" on a key alone --
+    the same oracle validation is limited to protect."""
+    import license as license_module
+
+    monkeypatch.setattr(
+        license_module,
+        "_onboarding_limiter",
+        license_module.RateLimiter(capacity=1, refill_per_second=0.0),
+    )
+
+    first = await client.post(
+        "/license/onboarding", json={"key": "AAAA-BBBB", "completed": True}
+    )
+    second = await client.post(
+        "/license/onboarding", json={"key": "AAAA-BBBB", "completed": True}
+    )
+
+    assert first.status_code == 200
+    assert first.json()["success"] is True
+    assert second.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_deactivate_is_rate_limited(client, seeded, monkeypatch):
+    import license as license_module
+
+    monkeypatch.setattr(
+        license_module,
+        "_deactivate_limiter",
+        license_module.RateLimiter(capacity=1, refill_per_second=0.0),
+    )
+
+    payload = {"key": "AAAA-BBBB", "email": "active@example.com"}
+    first = await client.post("/license/deactivate", json=payload)
+    second = await client.post("/license/deactivate", json=payload)
+
+    assert first.status_code == 200
+    assert first.json()["success"] is True
+    assert second.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_validate_returns_503_when_pool_unavailable(client, seeded, monkeypatch):
+    """A database outage is "ask again later", not "your licence is invalid"
+    and not a 500. The client has to be able to tell it apart from a verdict.
+    """
+    import db
+    import license as license_module
+
+    async def boom():
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(db, "acquire_pool", boom)
+
+    r = await client.post("/license/validate", json={"key": "AAAA-BBBB"})
+
+    assert r.status_code == 503
+    body = r.json()
+    # Not a ValidateResponse: no "valid" field to mistake for a business answer.
+    assert "valid" not in body
+    assert body["detail"] == "Licensing temporarily unavailable"
+
+
+@pytest.mark.asyncio
+async def test_mutating_endpoints_return_503_when_pool_unavailable(
+    client, seeded, monkeypatch
+):
+    import db
+
+    async def boom():
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(db, "acquire_pool", boom)
+
+    onboarding = await client.post(
+        "/license/onboarding", json={"key": "AAAA-BBBB", "completed": True}
+    )
+    deactivate = await client.post(
+        "/license/deactivate",
+        json={"key": "AAAA-BBBB", "email": "active@example.com"},
+    )
+
+    assert onboarding.status_code == 503
+    assert deactivate.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_cors_headers_absent_on_licensing_routes():
+    """A wildcard CORS policy over /license/validate would let any web page
+    read a customer's name and email cross-origin. The native client sends no
+    Origin, so these routes need no CORS at all."""
+    import httpx
+    from fastapi import FastAPI
+
+    from cors import ScopedCORSMiddleware
+
+    app = FastAPI()
+
+    @app.get("/search/{query}")
+    async def search(query: str):
+        return {"ok": True}
+
+    @app.post("/license/validate")
+    async def validate():
+        return {"valid": True, "email": "customer@example.com"}
+
+    app.add_middleware(
+        ScopedCORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        headers = {"Origin": "https://evil.example"}
+
+        music = await c.get("/search/anything", headers=headers)
+        licensing = await c.post("/license/validate", headers=headers)
+
+        # The music endpoints keep the behaviour they had.
+        assert music.headers.get("access-control-allow-origin") is not None
+        # The licensing route gets nothing, so a browser withholds the body.
+        assert licensing.headers.get("access-control-allow-origin") is None
+        assert licensing.headers.get("access-control-allow-credentials") is None
+
+
+@pytest.mark.asyncio
+async def test_cors_preflight_not_answered_for_licensing_routes():
+    """The preflight must not be answered either, or a non-simple
+    cross-origin request would be waved through."""
+    import httpx
+    from fastapi import FastAPI
+
+    from cors import ScopedCORSMiddleware
+
+    app = FastAPI()
+
+    @app.post("/license/validate")
+    async def validate():
+        return {"valid": True}
+
+    app.add_middleware(
+        ScopedCORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.request(
+            "OPTIONS",
+            "/license/validate",
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+
+    assert r.status_code != 200, "CORS middleware answered a preflight it should skip"
+    assert r.headers.get("access-control-allow-origin") is None
+
+
+# main.py cannot be imported into this process: it builds a YTMusic client at
+# module scope and pulls in uvicorn and dotenv, none of which belong in a
+# database test run. It is still the file where the licensing kill-switch and
+# the health report live, so it is exercised out of process with those three
+# imports stubbed. One subprocess per scenario also means each gets a clean
+# module-level LICENSING_ENABLED, which a same-process import could not.
+_MAIN_PROBE = r'''
+import json
+import os
+import sys
+import types
+
+ytmusicapi = types.ModuleType("ytmusicapi")
+
+
+class _FakeYTMusic:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def search(self, *args, **kwargs):
+        return []
+
+
+ytmusicapi.YTMusic = _FakeYTMusic
+sys.modules["ytmusicapi"] = ytmusicapi
+
+uvicorn = types.ModuleType("uvicorn")
+uvicorn.run = lambda *a, **k: None
+sys.modules["uvicorn"] = uvicorn
+
+dotenv = types.ModuleType("dotenv")
+dotenv.load_dotenv = lambda *a, **k: None
+sys.modules["dotenv"] = dotenv
+
+if os.environ.get("PROBE_BLOCK_ASYNCPG"):
+    # None in sys.modules is what makes "import asyncpg" raise ImportError,
+    # reproducing a machine where the driver was never installed.
+    sys.modules["asyncpg"] = None
+
+import main
+
+if os.environ.get("PROBE_INIT_POOL"):
+    import asyncio
+
+    import db
+
+    asyncio.run(db.init_pool(os.environ["PROBE_INIT_POOL"]))
+
+import asyncio
+
+health = asyncio.run(main.health_check())
+
+print(json.dumps({
+    "licensing": health["licensing"],
+    "status": health["status"],
+    "routes": sorted(
+        r.path for r in main.app.routes if getattr(r, "path", "").startswith("/license")
+    ),
+    "enabled": main.LICENSING_ENABLED,
+}))
+'''
+
+
+def _probe_main(**env):
+    """Import main.py in a subprocess and report its licensing state."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    child_env = dict(os.environ)
+    child_env.pop("DATABASE_URL", None)
+    child_env.update({k: v for k, v in env.items() if v is not None})
+
+    result = subprocess.run(
+        [sys.executable, "-c", _MAIN_PROBE],
+        cwd=str(Path(__file__).parent),
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"importing main.py failed:\n{result.stdout}\n{result.stderr}"
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_health_reports_licensing_disabled_without_database_url():
+    assert _probe_main()["licensing"] == "disabled"
+
+
+def test_missing_asyncpg_disables_licensing_instead_of_killing_the_process():
+    """The bundled macOS app hands this process its whole environment and
+    main.py calls load_dotenv(), so a stray DATABASE_URL on a user's machine
+    turns licensing on where asyncpg was never installed. An unguarded import
+    would raise at module scope, uvicorn would exit, and the user would lose
+    all playback while search kept working."""
+    probe = _probe_main(
+        DATABASE_URL="postgresql://localhost/nope", PROBE_BLOCK_ASYNCPG="1"
+    )
+
+    assert probe["enabled"] is False
+    assert probe["routes"] == [], "licensing routes registered without a driver"
+    assert probe["licensing"] == "disabled"
+
+
+def test_health_reports_degraded_when_enabled_but_pool_is_missing():
+    """The failure this names is invisible otherwise: startup pool init is
+    deliberately non-fatal, so a process with completely broken licensing
+    still answers /health as healthy."""
+    probe = _probe_main(DATABASE_URL="postgresql://localhost/nope")
+
+    assert probe["enabled"] is True
+    assert "/license/validate" in probe["routes"]
+    assert probe["licensing"] == "degraded"
+    # Railway restarts a service whose healthcheck fails. Reporting the
+    # degradation must not become a way of taking /search down.
+    assert probe["status"] == "healthy"
+
+
+def test_health_reports_ready_when_pool_exists(migrated_conn):
+    from conftest import TEST_DSN
+
+    probe = _probe_main(DATABASE_URL=TEST_DSN, PROBE_INIT_POOL=TEST_DSN)
+
+    assert probe["licensing"] == "ready"

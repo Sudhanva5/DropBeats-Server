@@ -1,5 +1,5 @@
 from fastapi import FastAPI, WebSocket, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from cors import ScopedCORSMiddleware
 from ytmusicapi import YTMusic
 from typing import Dict, List, Optional, Set
 import json
@@ -41,10 +41,14 @@ class Client:
 
 app = FastAPI(title="DropBeat Music API")
 
-# Enable CORS with environment configuration
+# Enable CORS with environment configuration.
+# ScopedCORSMiddleware, not CORSMiddleware: ALLOWED_ORIGINS defaults to "*"
+# with credentials, and /license/validate returns a customer's name and email.
+# See cors.py -- the licensing and webhook routes get no CORS headers at all,
+# which is exactly right for a native client that sends no Origin.
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
-    CORSMiddleware,
+    ScopedCORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
@@ -58,9 +62,24 @@ app.add_middleware(
 LICENSING_ENABLED = bool(os.getenv("DATABASE_URL"))
 
 if LICENSING_ENABLED:
-    from license import router as license_router
-
-    app.include_router(license_router)
+    try:
+        from license import router as license_router
+    except ImportError as exc:
+        # Everything downstream of this import is defended; the import itself
+        # was not. The bundled macOS app passes its whole parent environment
+        # to this process and main.py calls load_dotenv(), so a stray
+        # DATABASE_URL on a user's machine flips LICENSING_ENABLED on where
+        # asyncpg is not installed. Raising here would exit uvicorn, the app's
+        # supervisor would retry and give up, and the user would lose all
+        # playback. Licensing off is the correct answer instead.
+        LICENSING_ENABLED = False
+        logger.error(
+            "❌ DATABASE_URL is set but the licensing dependencies are not "
+            "installed (%s). Licensing is disabled; search and playback are "
+            "unaffected.", exc
+        )
+    else:
+        app.include_router(license_router)
 
 # Initialize YTMusic with environment configuration
 ytmusic_oauth = os.getenv("YTMUSIC_OAUTH_FILE", "oauth.json")
@@ -153,11 +172,35 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+def licensing_status() -> str:
+    """Licensing state: disabled (no DATABASE_URL), ready (pool up), degraded."""
+    if not LICENSING_ENABLED:
+        return "disabled"
+    try:
+        import db
+
+        db.get_pool()
+    except Exception:
+        # get_pool() deliberately does not connect, so this is a cheap read of
+        # "did init succeed", not a probe.
+        return "degraded"
+    return "ready"
+
 @app.get("/health")
 @app.head("/health")
 async def health_check():
-    """Check if the server is running"""
-    return {"status": "healthy", "timestamp": time.time()}
+    """Check if the server is running.
+
+    Reports licensing state but never fails on it. Railway restarts a service
+    whose healthcheck fails, and the whole point of the non-fatal startup
+    design is that a licensing outage must not take /search and
+    /watch-playlist down -- failing here would do precisely that.
+    """
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "licensing": licensing_status(),
+    }
 
 @app.get("/test-ytmusic")
 async def test_ytmusic():

@@ -70,11 +70,23 @@ async def main() -> int:
         print("DATABASE_URL is not set", file=sys.stderr)
         return 1
 
+    password = os.environ.get("APP_DB_PASSWORD")
+    if not password:
+        # Checked before connecting, because the failure it prevents is
+        # ugly: 002_roles_rls.sql grants TO dropbeats_app, so skipping the
+        # role and pressing on dies with "role does not exist" only after
+        # 001 has committed and been recorded as applied.
+        print(
+            "APP_DB_PASSWORD is not set. It is required: the role it creates "
+            "(dropbeats_app) is granted to by 002_roles_rls.sql, so migrating "
+            "without it fails part-way through.",
+            file=sys.stderr,
+        )
+        return 1
+
     conn = await asyncpg.connect(dsn)
     try:
-        password = os.environ.get("APP_DB_PASSWORD")
-        if password:
-            await ensure_app_role(conn, password)
+        await ensure_app_role(conn, password)
         applied = await apply(conn, MIGRATIONS_DIR)
     finally:
         await conn.close()

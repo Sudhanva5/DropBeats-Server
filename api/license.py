@@ -9,9 +9,9 @@ p_device_id parameter through three functions.
 import json
 import logging
 import os
+import re
 import secrets
 import time
-from collections import defaultdict
 from typing import Callable
 
 import asyncpg
@@ -39,21 +39,55 @@ class ValidateResponse(BaseModel):
     has_completed_onboarding: bool | None = None
 
 
+# The single definition of "this key identifies this licence". Every endpoint
+# that resolves a key uses it: three hand-copied predicates drifting apart
+# would be a silent change to how licences are matched. $1 is the key.
+KEY_MATCH = "normalize_license_key(license_key) = normalize_license_key($1)"
+
 # Field names match the Swift Codable decoders in LicenseModels.swift and are
 # not free to change.
-LOOKUP_SQL = """
+LOOKUP_SQL = f"""
     select id, full_name, email, country, is_active, created_at,
            has_completed_onboarding
     from licenses
-    where normalize_license_key(license_key) = normalize_license_key($1)
+    where {KEY_MATCH}
 """
 
 
+# Longest possible textual IPv6 address (an IPv4-mapped form with a zone id).
+# Anything longer is not an address and must never become a dict key.
+_MAX_KEY_LENGTH = 45
+
+# The characters an IPv4 or IPv6 literal can be spelt with: hex digits, the
+# IPv4 dot, the IPv6 colon, and % introducing a zone id.
+_IP_SHAPED = re.compile(r"^[0-9A-Fa-f.:%]+$")
+
+
+def _is_ip_shaped(value: str) -> bool:
+    """Cheap plausibility check, not a parser.
+
+    The point is not to validate addresses, it is to keep an attacker from
+    choosing arbitrary dictionary keys: whatever survives this is short and
+    drawn from a small alphabet, so the key space a spoofer can reach is
+    bounded in both length and content.
+    """
+    return (
+        bool(value)
+        and len(value) <= _MAX_KEY_LENGTH
+        and _IP_SHAPED.match(value) is not None
+    )
+
+
 class RateLimiter:
-    """Per-key token bucket.
+    """Per-key token bucket with a bounded number of keys.
 
     In-process, so it protects a single instance only. If this service ever
     runs more than one replica this needs to move to shared state.
+
+    The bucket dict is attacker-keyed (see _client_key: X-Forwarded-For is
+    spoofable by design), so it must not be allowed to grow without limit --
+    an unauthenticated flood of distinct keys would otherwise exhaust the
+    container's memory and take /search down with it.
     """
 
     def __init__(
@@ -61,28 +95,71 @@ class RateLimiter:
         capacity: int,
         refill_per_second: float,
         clock: Callable[[], float] = time.monotonic,
+        max_buckets: int = 10_000,
     ) -> None:
         self.capacity = capacity
         self.refill_per_second = refill_per_second
         self.clock = clock
+        self.max_buckets = max_buckets
+        # Insertion order is recency order: allow() re-inserts every key it
+        # touches, so the oldest entry is the least recently seen.
         self._buckets: dict[str, tuple[float, float]] = {}
 
     def allow(self, key: str) -> bool:
         now = self.clock()
-        tokens, last = self._buckets.get(key, (float(self.capacity), now))
+        tokens, last = self._buckets.pop(key, (float(self.capacity), now))
         tokens = min(self.capacity, tokens + (now - last) * self.refill_per_second)
 
         if tokens < 1.0:
             self._buckets[key] = (tokens, now)
-            return False
+            allowed = False
+        else:
+            self._buckets[key] = (tokens - 1.0, now)
+            allowed = True
 
-        self._buckets[key] = (tokens - 1.0, now)
-        return True
+        if len(self._buckets) > self.max_buckets:
+            self._evict(now)
+        return allowed
+
+    def reset(self) -> None:
+        """Forget every bucket. For tests; the limiter is module-global."""
+        self._buckets.clear()
+
+    def _evict(self, now: float) -> None:
+        # Trim to a low-water mark rather than to exactly the cap. Stopping at
+        # the cap would mean this O(n) scan ran on every single request once
+        # the dict was full -- which is exactly when the process is under the
+        # flood this exists to survive. Freeing a tenth at a time amortises it.
+        target = self.max_buckets - max(1, self.max_buckets // 10)
+
+        # A bucket that has refilled to capacity is indistinguishable from a
+        # key that has never been seen, so dropping it changes no answer --
+        # the key simply gets a fresh full bucket next time it appears.
+        for key, (tokens, last) in list(self._buckets.items()):
+            if len(self._buckets) <= target:
+                return
+            refilled = tokens + (now - last) * self.refill_per_second
+            if refilled >= self.capacity:
+                del self._buckets[key]
+
+        # Still over: everything left is mid-consumption, so drop the least
+        # recently touched. Insertion order is recency order, and the key just
+        # touched is at the end, so an active client is never the one dropped.
+        while len(self._buckets) > target:
+            del self._buckets[next(iter(self._buckets))]
 
 
 # 30 validations per minute per IP. The app validates once a day; anything
 # near this ceiling is not a real client.
 _validate_limiter = RateLimiter(capacity=30, refill_per_second=0.5)
+
+# The two mutating endpoints are far rarer than validation -- onboarding fires
+# once in a licence's life and deactivation is a manual act -- but both answer
+# "does this key exist?", which is exactly what validation is limited to
+# protect. Separate buckets so abuse of one cannot lock a user out of the
+# other. 10 burst, 6/minute sustained.
+_deactivate_limiter = RateLimiter(capacity=10, refill_per_second=0.1)
+_onboarding_limiter = RateLimiter(capacity=10, refill_per_second=0.1)
 
 
 def _client_key(request: Request) -> str:
@@ -94,21 +171,50 @@ def _client_key(request: Request) -> str:
     is client-spoofable, which is an accepted trade-off: this limiter is a
     courtesy guard on an endpoint whose real secret is the licence key, and
     starving legitimate users is the worse failure.
+
+    Spoofable, however, must not mean unbounded: anything that is not shaped
+    like an IP address is discarded rather than turned into a dict key, so a
+    caller cannot spend the process's memory a header at a time.
     """
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         first = forwarded.split(",")[0].strip()
-        if first:
+        if _is_ip_shaped(first):
             return first
-    return request.client.host if request.client else "unknown"
+    peer = request.client.host if request.client else None
+    if peer and _is_ip_shaped(peer):
+        return peer
+    return "unknown"
+
+
+def _enforce_rate_limit(limiter: RateLimiter, request: Request) -> None:
+    if not limiter.allow(_client_key(request)):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+
+async def _pool_or_503() -> asyncpg.Pool:
+    """The pool, or a 503 the client can tell apart from a business answer.
+
+    Startup pool init is non-fatal and acquire_pool() re-tries lazily, so a
+    request can legitimately arrive with no usable database. Letting that
+    escape as a 500 tells the client "we broke", when the truthful answer is
+    "ask again later" -- and the macOS app must not treat it as a verdict on
+    the licence.
+    """
+    try:
+        return await db.acquire_pool()
+    except Exception as exc:  # asyncpg errors, DNS failures, missing DSN
+        logger.error("licensing database unavailable: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="Licensing temporarily unavailable"
+        ) from exc
 
 
 @router.post("/license/validate", response_model=ValidateResponse)
 async def validate_license(payload: ValidateRequest, request: Request) -> ValidateResponse:
-    if not _validate_limiter.allow(_client_key(request)):
-        raise HTTPException(status_code=429, detail="Too many requests")
+    _enforce_rate_limit(_validate_limiter, request)
 
-    pool = await db.acquire_pool()
+    pool = await _pool_or_503()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(LOOKUP_SQL, payload.key)
 
@@ -152,16 +258,22 @@ class OnboardingRequest(BaseModel):
 
 
 @router.post("/license/deactivate", response_model=MutationResponse)
-async def deactivate_license(payload: DeactivateRequest) -> MutationResponse:
-    pool = await db.acquire_pool()
+async def deactivate_license(
+    payload: DeactivateRequest, request: Request
+) -> MutationResponse:
+    # Unauthenticated and state-mutating: limited for the same reason
+    # /license/validate is.
+    _enforce_rate_limit(_deactivate_limiter, request)
+
+    pool = await _pool_or_503()
     async with pool.acquire() as conn:
         # Email is matched alongside the key so that possession of a key alone
         # cannot deactivate a licence.
         updated = await conn.fetchval(
-            """
+            f"""
             update licenses
             set is_active = false
-            where normalize_license_key(license_key) = normalize_license_key($1)
+            where {KEY_MATCH}
               and lower(email) = lower($2)
             returning id
             """,
@@ -176,14 +288,20 @@ async def deactivate_license(payload: DeactivateRequest) -> MutationResponse:
 
 
 @router.post("/license/onboarding", response_model=MutationResponse)
-async def update_onboarding(payload: OnboardingRequest) -> MutationResponse:
-    pool = await db.acquire_pool()
+async def update_onboarding(
+    payload: OnboardingRequest, request: Request
+) -> MutationResponse:
+    # This answers "does this key exist?" on a key alone -- the same oracle
+    # /license/validate is limited to protect, with a write attached.
+    _enforce_rate_limit(_onboarding_limiter, request)
+
+    pool = await _pool_or_503()
     async with pool.acquire() as conn:
         updated = await conn.fetchval(
-            """
+            f"""
             update licenses
             set has_completed_onboarding = $2
-            where normalize_license_key(license_key) = normalize_license_key($1)
+            where {KEY_MATCH}
             returning id
             """,
             payload.key,
@@ -219,7 +337,7 @@ async def gumroad_webhook(secret: str, request: Request) -> MutationResponse:
     form = await request.form()
     payload = dict(form)
 
-    pool = await db.acquire_pool()
+    pool = await _pool_or_503()
     async with pool.acquire() as conn:
         # Logged before any validation, so a rejected webhook is still
         # evidence. The original design got this right.

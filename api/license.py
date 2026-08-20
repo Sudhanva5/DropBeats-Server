@@ -6,8 +6,10 @@ built its lookup SQL with format() and execute(), and threaded a dead
 p_device_id parameter through three functions.
 """
 
+import json
 import logging
 import os
+import secrets
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -130,3 +132,77 @@ async def update_onboarding(payload: OnboardingRequest) -> MutationResponse:
     if updated is None:
         return MutationResponse(success=False, error="License not found")
     return MutationResponse(success=True, message="Onboarding status updated")
+
+
+@router.post("/webhooks/gumroad/{secret}", response_model=MutationResponse)
+async def gumroad_webhook(secret: str, request: Request) -> MutationResponse:
+    """Gumroad sale notification.
+
+    Two independent factors guard this: an unguessable path segment and a
+    seller_id check. Gumroad does not sign its pings, so the secret path is
+    what stands in for a signature.
+    """
+    expected_secret = os.environ.get("GUMROAD_WEBHOOK_SECRET", "")
+    # compare_digest so the path segment cannot be recovered by timing.
+    if not expected_secret or not secrets.compare_digest(secret, expected_secret):
+        # 404 rather than 403: an attacker probing paths learns nothing about
+        # whether this route exists.
+        raise HTTPException(status_code=404, detail="Not found")
+
+    form = await request.form()
+    payload = dict(form)
+
+    pool = db.get_pool()
+    async with pool.acquire() as conn:
+        # Logged before any validation, so a rejected webhook is still
+        # evidence. The original design got this right.
+        await conn.execute(
+            "insert into webhook_logs (payload, success) values ($1::jsonb, $2)",
+            json.dumps(payload),
+            True,
+        )
+
+        expected_seller = os.environ.get("GUMROAD_SELLER_ID", "")
+        if payload.get("seller_id") != expected_seller:
+            logger.warning("gumroad webhook: seller_id mismatch")
+            await conn.execute(
+                "insert into webhook_logs (payload, success, error) "
+                "values ($1::jsonb, false, $2)",
+                json.dumps({"event": "seller_verification_failed"}),
+                "Invalid seller ID",
+            )
+            return MutationResponse(success=False, error="Invalid seller ID")
+
+        email = payload.get("email")
+        license_key = payload.get("license_key")
+        if not email or not license_key:
+            await conn.execute(
+                "insert into webhook_logs (payload, success, error) "
+                "values ($1::jsonb, false, $2)",
+                json.dumps({"event": "missing_fields"}),
+                "Missing email or license_key",
+            )
+            return MutationResponse(success=False, error="Missing email or license_key")
+
+        full_name = payload.get("full_name") or email.split("@")[0]
+
+        # Upsert on sale_id makes Gumroad retries idempotent.
+        await conn.execute(
+            """
+            insert into licenses (email, full_name, country, license_key, sale_id)
+            values ($1, $2, $3, $4, $5)
+            on conflict (sale_id) do update
+            set email      = excluded.email,
+                full_name  = excluded.full_name,
+                country    = excluded.country,
+                license_key = excluded.license_key
+            """,
+            email,
+            full_name,
+            payload.get("country_code") or "Unknown",
+            license_key,
+            payload.get("sale_id"),
+        )
+
+    logger.info("gumroad webhook: licence created or updated")
+    return MutationResponse(success=True, message="License created")

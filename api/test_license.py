@@ -1,6 +1,70 @@
 import pytest
 
 
+GUMROAD_SALE = {
+    "email": "buyer@example.com",
+    "full_name": "Buyer Person",
+    "seller_id": "test-seller",
+    "sale_id": "sale_new_1",
+    "license_key": "EEEE-FFFF",
+    "country_code": "IN",
+}
+
+
+@pytest.mark.asyncio
+async def test_webhook_creates_licence(client, migrated_conn):
+    r = await client.post("/webhooks/gumroad/test-secret", data=GUMROAD_SALE)
+    assert r.status_code == 200
+    assert r.json()["success"] is True
+
+    row = await migrated_conn.fetchrow(
+        "select email, full_name, country, is_active from licenses "
+        "where license_key = 'EEEE-FFFF'"
+    )
+    assert row["email"] == "buyer@example.com"
+    assert row["full_name"] == "Buyer Person"
+    assert row["country"] == "IN"
+    assert row["is_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_webhook_replay_creates_exactly_one_licence(client, migrated_conn):
+    """Gumroad retries on non-2xx. The original handler inserted
+    unconditionally, so a retry duplicated the licence."""
+    await client.post("/webhooks/gumroad/test-secret", data=GUMROAD_SALE)
+    await client.post("/webhooks/gumroad/test-secret", data=GUMROAD_SALE)
+
+    count = await migrated_conn.fetchval(
+        "select count(*) from licenses where sale_id = 'sale_new_1'"
+    )
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_wrong_seller(client, migrated_conn):
+    payload = dict(GUMROAD_SALE, seller_id="impostor")
+    r = await client.post("/webhooks/gumroad/test-secret", data=payload)
+    assert r.json()["success"] is False
+
+    count = await migrated_conn.fetchval("select count(*) from licenses")
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_wrong_secret_path(client):
+    r = await client.post("/webhooks/gumroad/wrong-secret", data=GUMROAD_SALE)
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_webhook_logs_every_payload_including_rejected(client, migrated_conn):
+    await client.post(
+        "/webhooks/gumroad/test-secret", data=dict(GUMROAD_SALE, seller_id="impostor")
+    )
+    count = await migrated_conn.fetchval("select count(*) from webhook_logs")
+    assert count >= 1
+
+
 @pytest.mark.asyncio
 async def test_migrations_create_licenses_table(migrated_conn):
     exists = await migrated_conn.fetchval(

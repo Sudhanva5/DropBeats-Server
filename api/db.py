@@ -5,14 +5,13 @@ database driver into a process that has no database.
 """
 
 import os
-from typing import Optional
 
 import asyncpg
 
-_pool: Optional[asyncpg.Pool] = None
+_pool: asyncpg.Pool | None = None
 
 
-async def init_pool(dsn: Optional[str] = None) -> asyncpg.Pool:
+async def init_pool(dsn: str | None = None) -> asyncpg.Pool:
     global _pool
     if _pool is None:
         _pool = await asyncpg.create_pool(

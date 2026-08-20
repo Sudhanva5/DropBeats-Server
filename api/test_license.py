@@ -62,3 +62,23 @@ async def test_app_role_cannot_update_webhook_logs(migrated_conn):
             await app_conn.execute("update webhook_logs set success = false")
     finally:
         await app_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_get_pool_before_init_raises():
+    import db
+
+    await db.close_pool()
+    with pytest.raises(RuntimeError, match="not initialised"):
+        db.get_pool()
+
+
+@pytest.mark.asyncio
+async def test_init_pool_is_idempotent(migrated_conn):
+    import db
+
+    await db.close_pool()
+    first = await db.init_pool("postgresql://localhost/dropbeats_test")
+    second = await db.init_pool("postgresql://localhost/dropbeats_test")
+    assert first is second
+    await db.close_pool()

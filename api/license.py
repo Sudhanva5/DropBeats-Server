@@ -67,6 +67,6 @@ async def validate_license(payload: ValidateRequest) -> ValidateResponse:
             name=row["full_name"],
             email=row["email"],
             country=row["country"],
-            created_at=row["created_at"].isoformat(),
+            created_at=row["created_at"].isoformat(timespec="seconds"),
             has_completed_onboarding=row["has_completed_onboarding"],
         )

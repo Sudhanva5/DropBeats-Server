@@ -98,6 +98,27 @@ async def test_validate_accepts_known_active_key(client, seeded):
 
 
 @pytest.mark.asyncio
+async def test_validate_created_at_has_no_fractional_seconds(client, seeded, migrated_conn):
+    """The shipped Swift decoder has no fractional-seconds formatter, so a
+    microsecond component makes the whole response undecodable."""
+    from datetime import datetime
+
+    # Force a created_at with a non-zero microsecond component so this test
+    # doesn't pass by luck if now() happens to land on a whole second.
+    await migrated_conn.execute(
+        "update licenses set created_at = '2025-01-20 09:47:01.123456+00' "
+        "where license_key = 'AAAA-BBBB'"
+    )
+
+    r = await client.post("/license/validate", json={"key": "AAAA-BBBB"})
+    created_at = r.json()["created_at"]
+
+    assert "." not in created_at, f"fractional seconds present: {created_at}"
+    # Must round-trip through a strict parser.
+    assert datetime.fromisoformat(created_at) is not None
+
+
+@pytest.mark.asyncio
 async def test_validate_rejects_unknown_key(client, seeded):
     r = await client.post("/license/validate", json={"key": "NOPE-NOPE"})
     assert r.status_code == 200

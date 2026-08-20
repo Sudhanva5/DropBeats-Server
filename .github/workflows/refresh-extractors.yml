@@ -1,0 +1,135 @@
+name: Refresh extractors
+
+# ytmusicapi parses YouTube's undocumented internal JSON, so a YouTube-side
+# change can break /watch-playlist or /search at any time with no commit here.
+# That is exactly what happened in August 2026: ytmusicapi 1.11.1 started
+# raising KeyError: 'endpoint', /watch-playlist returned 500, and autoplay in
+# the macOS app died silently for months.
+#
+# This workflow runs the smoke test weekly against the pinned version, then
+# against the newest release. If the newest release is healthy and differs from
+# the pin, it bumps requirements.txt and pushes, which triggers a Railway
+# deploy. If the newest release is also broken, it fails loudly instead.
+#
+# yt-dlp is intentionally out of scope: YouTube blocks it from datacenter IPs,
+# so it cannot be exercised from a GitHub runner, and Railway no longer serves
+# the yt-dlp endpoints. The bundled copy in the macOS app is unpinned and picks
+# up the newest release at DMG build time.
+
+on:
+  schedule:
+    # 06:00 UTC every Monday.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: refresh-extractors
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Match NIXPACKS_PYTHON_VERSION in nixpacks.toml.
+          python-version: '3.11'
+
+      - name: Install pinned requirements
+        run: python -m pip install --quiet -r api/requirements.txt
+
+      - name: Record pinned version
+        id: pinned
+        run: echo "version=$(python -c 'import ytmusicapi; print(ytmusicapi.__version__)')" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test pinned version
+        id: smoke_pinned
+        continue-on-error: true
+        run: python api/smoke_test.py
+
+      - name: Upgrade to newest ytmusicapi
+        id: newest
+        run: |
+          python -m pip install --quiet --upgrade ytmusicapi
+          echo "version=$(python -c 'import ytmusicapi; print(ytmusicapi.__version__)')" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test newest version
+        id: smoke_newest
+        continue-on-error: true
+        run: python api/smoke_test.py
+
+      - name: Report
+        env:
+          PINNED: ${{ steps.pinned.outputs.version }}
+          NEWEST: ${{ steps.newest.outputs.version }}
+          PINNED_RESULT: ${{ steps.smoke_pinned.outcome }}
+          NEWEST_RESULT: ${{ steps.smoke_newest.outcome }}
+        run: |
+          {
+            echo "| check | version | result |"
+            echo "|---|---|---|"
+            echo "| pinned | \`$PINNED\` | $PINNED_RESULT |"
+            echo "| newest | \`$NEWEST\` | $NEWEST_RESULT |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bump pin and deploy
+        # Only when the newest release is verified healthy AND differs from the
+        # pin. Covers both cases: routine upgrade, and repairing a live outage.
+        if: >-
+          steps.smoke_newest.outcome == 'success' &&
+          steps.newest.outputs.version != steps.pinned.outputs.version
+        env:
+          PINNED: ${{ steps.pinned.outputs.version }}
+          NEWEST: ${{ steps.newest.outputs.version }}
+          WAS_BROKEN: ${{ steps.smoke_pinned.outcome }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          path = pathlib.Path("api/requirements.txt")
+          text = path.read_text()
+          updated, count = re.subn(
+              r"^ytmusicapi==.*$",
+              f"ytmusicapi=={os.environ['NEWEST']}",
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit(f"expected one ytmusicapi pin in {path}, replaced {count}")
+          path.write_text(updated)
+          PY
+
+          if [ "$WAS_BROKEN" = "failure" ]; then
+            reason="the pinned version was failing the smoke test"
+          else
+            reason="a newer release is available"
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add api/requirements.txt
+          git commit -m "Chore: Bump ytmusicapi ${PINNED} -> ${NEWEST}" \
+                     -m "Automated by .github/workflows/refresh-extractors.yml because ${reason}. The smoke test passes against ${NEWEST} for /health, /search and /watch-playlist."
+          git push
+          echo "Bumped ytmusicapi ${PINNED} -> ${NEWEST}; Railway will redeploy." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if newest release is broken
+        if: steps.smoke_newest.outcome == 'failure'
+        env:
+          PINNED_RESULT: ${{ steps.smoke_pinned.outcome }}
+        run: |
+          if [ "$PINNED_RESULT" = "failure" ]; then
+            echo "::error::/watch-playlist or /search is broken on both the pinned and the newest ytmusicapi. Railway is serving a broken endpoint and no upstream release fixes it - needs a human."
+          else
+            echo "::error::The newest ytmusicapi fails the smoke test. Keeping the current pin, which still passes. No deploy was made."
+          fi
+          exit 1

@@ -223,6 +223,58 @@ async def test_init_pool_is_idempotent(migrated_conn):
 
 
 @pytest.mark.asyncio
+async def test_acquire_pool_initialises_and_is_idempotent(migrated_conn, monkeypatch):
+    """acquire_pool() builds a pool when there is none, then reuses it.
+
+    It reads DATABASE_URL rather than taking a dsn, because the endpoints that
+    call it have no dsn to pass.
+    """
+    import db
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/dropbeats_test")
+    await db.close_pool()
+    with pytest.raises(RuntimeError, match="not initialised"):
+        db.get_pool()
+
+    first = await db.acquire_pool()
+    second = await db.acquire_pool()
+    assert first is second
+    # The lazily created pool is the module's pool, not a private one.
+    assert db.get_pool() is first
+    await db.close_pool()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_heals_itself_when_startup_init_never_ran(
+    client, seeded, monkeypatch
+):
+    """A request succeeds even though no pool was initialised at startup.
+
+    main.py's startup pool init is deliberately non-fatal, so a database that
+    was down at boot leaves a healthy process with no pool and no restart
+    coming. This is the path that makes licensing recover anyway: the first
+    request after the database returns initialises the pool itself.
+    """
+    import db
+
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql://dropbeats_app:test_password@localhost/dropbeats_test",
+    )
+    # Undo the fixture's init_pool to reproduce a failed startup init.
+    await db.close_pool()
+    with pytest.raises(RuntimeError, match="not initialised"):
+        db.get_pool()
+
+    r = await client.post("/license/validate", json={"key": "AAAA-BBBB"})
+
+    assert r.status_code == 200
+    assert r.json()["valid"] is True
+    # The endpoint left a usable pool behind, so later requests are cheap.
+    assert db.get_pool() is not None
+
+
+@pytest.mark.asyncio
 async def test_validate_accepts_known_active_key(client, seeded):
     r = await client.post("/license/validate", json={"key": "AAAA-BBBB"})
     assert r.status_code == 200

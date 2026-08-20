@@ -108,7 +108,7 @@ async def validate_license(payload: ValidateRequest, request: Request) -> Valida
     if not _validate_limiter.allow(_client_key(request)):
         raise HTTPException(status_code=429, detail="Too many requests")
 
-    pool = db.get_pool()
+    pool = await db.acquire_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(LOOKUP_SQL, payload.key)
 
@@ -153,7 +153,7 @@ class OnboardingRequest(BaseModel):
 
 @router.post("/license/deactivate", response_model=MutationResponse)
 async def deactivate_license(payload: DeactivateRequest) -> MutationResponse:
-    pool = db.get_pool()
+    pool = await db.acquire_pool()
     async with pool.acquire() as conn:
         # Email is matched alongside the key so that possession of a key alone
         # cannot deactivate a licence.
@@ -177,7 +177,7 @@ async def deactivate_license(payload: DeactivateRequest) -> MutationResponse:
 
 @router.post("/license/onboarding", response_model=MutationResponse)
 async def update_onboarding(payload: OnboardingRequest) -> MutationResponse:
-    pool = db.get_pool()
+    pool = await db.acquire_pool()
     async with pool.acquire() as conn:
         updated = await conn.fetchval(
             """
@@ -219,7 +219,7 @@ async def gumroad_webhook(secret: str, request: Request) -> MutationResponse:
     form = await request.form()
     payload = dict(form)
 
-    pool = db.get_pool()
+    pool = await db.acquire_pool()
     async with pool.acquire() as conn:
         # Logged before any validation, so a rejected webhook is still
         # evidence. The original design got this right.

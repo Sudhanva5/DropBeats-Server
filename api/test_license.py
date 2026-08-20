@@ -30,9 +30,20 @@ async def test_webhook_creates_licence(client, migrated_conn):
 @pytest.mark.asyncio
 async def test_webhook_replay_creates_exactly_one_licence(client, migrated_conn):
     """Gumroad retries on non-2xx. The original handler inserted
-    unconditionally, so a retry duplicated the licence."""
-    await client.post("/webhooks/gumroad/test-secret", data=GUMROAD_SALE)
-    await client.post("/webhooks/gumroad/test-secret", data=GUMROAD_SALE)
+    unconditionally, so a retry duplicated the licence.
+
+    A naive unconditional-INSERT handler would 500 on the second post and
+    still leave exactly one row, so the row count alone doesn't prove
+    idempotency — the second response must also succeed, since that's the
+    2xx Gumroad needs to see to stop retrying.
+    """
+    first = await client.post("/webhooks/gumroad/test-secret", data=GUMROAD_SALE)
+    second = await client.post("/webhooks/gumroad/test-secret", data=GUMROAD_SALE)
+
+    assert first.status_code == 200
+    assert first.json()["success"] is True
+    assert second.status_code == 200
+    assert second.json()["success"] is True
 
     count = await migrated_conn.fetchval(
         "select count(*) from licenses where sale_id = 'sale_new_1'"
@@ -51,18 +62,81 @@ async def test_webhook_rejects_wrong_seller(client, migrated_conn):
 
 
 @pytest.mark.asyncio
+async def test_webhook_rejects_empty_seller_when_env_unset(client, migrated_conn, monkeypatch):
+    """A missing GUMROAD_SELLER_ID must fail closed, not compare "" == ""
+    against an attacker-supplied empty seller_id field."""
+    monkeypatch.setenv("GUMROAD_SELLER_ID", "")
+    payload = dict(GUMROAD_SALE, seller_id="")
+    r = await client.post("/webhooks/gumroad/test-secret", data=payload)
+    assert r.json()["success"] is False
+
+    count = await migrated_conn.fetchval("select count(*) from licenses")
+    assert count == 0
+
+
+@pytest.mark.asyncio
 async def test_webhook_rejects_wrong_secret_path(client):
     r = await client.post("/webhooks/gumroad/wrong-secret", data=GUMROAD_SALE)
     assert r.status_code == 404
 
 
 @pytest.mark.asyncio
+async def test_webhook_rejects_non_ascii_secret_path(client):
+    """compare_digest raises TypeError on non-ASCII str input. That must not
+    escape as a 500 -- a 500 here versus a 404 for other bad paths would be a
+    one-request oracle revealing that the route exists."""
+    r = await client.post("/webhooks/gumroad/%C3%A9", data=GUMROAD_SALE)
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_missing_sale_id(client, migrated_conn):
+    payload = dict(GUMROAD_SALE)
+    del payload["sale_id"]
+    r = await client.post("/webhooks/gumroad/test-secret", data=payload)
+    assert r.json()["success"] is False
+
+    count = await migrated_conn.fetchval("select count(*) from licenses")
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_webhook_reuse_of_license_key_under_new_sale_returns_200_failure(
+    client, migrated_conn
+):
+    """sale_id is the ON CONFLICT arbiter, but license_key carries its own
+    unique constraint. A different sale reusing a license_key must not raise
+    -- Gumroad only stops retrying on a 2xx, so a genuine data conflict must
+    still be reported as success=False on a 200, not surfaced as a 500."""
+    await client.post("/webhooks/gumroad/test-secret", data=GUMROAD_SALE)
+
+    conflicting = dict(GUMROAD_SALE, sale_id="sale_new_2")
+    r = await client.post("/webhooks/gumroad/test-secret", data=conflicting)
+
+    assert r.status_code == 200
+    assert r.json()["success"] is False
+
+    count = await migrated_conn.fetchval(
+        "select count(*) from licenses where license_key = 'EEEE-FFFF'"
+    )
+    assert count == 1
+
+
+@pytest.mark.asyncio
 async def test_webhook_logs_every_payload_including_rejected(client, migrated_conn):
+    """Two rows, not just >=1: the rejection branch writes its own row, so a
+    loose >=1 assertion would also pass for a handler that only logs on
+    failure and never logs before validating."""
     await client.post(
         "/webhooks/gumroad/test-secret", data=dict(GUMROAD_SALE, seller_id="impostor")
     )
     count = await migrated_conn.fetchval("select count(*) from webhook_logs")
-    assert count >= 1
+    assert count == 2
+
+    pre_validation_email = await migrated_conn.fetchval(
+        "select payload->>'email' from webhook_logs order by received_at asc limit 1"
+    )
+    assert pre_validation_email == GUMROAD_SALE["email"]
 
 
 @pytest.mark.asyncio

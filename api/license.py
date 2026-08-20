@@ -11,6 +11,7 @@ import logging
 import os
 import secrets
 
+import asyncpg
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
@@ -143,8 +144,14 @@ async def gumroad_webhook(secret: str, request: Request) -> MutationResponse:
     what stands in for a signature.
     """
     expected_secret = os.environ.get("GUMROAD_WEBHOOK_SECRET", "")
-    # compare_digest so the path segment cannot be recovered by timing.
-    if not expected_secret or not secrets.compare_digest(secret, expected_secret):
+    # compare_digest so the path segment cannot be recovered by timing. Compare
+    # bytes, not str: compare_digest raises TypeError on non-ASCII str input,
+    # and a percent-decoded path segment can contain non-ASCII characters —
+    # letting that exception escape as a 500 would be a one-request oracle
+    # distinguishing "route exists" from "route doesn't exist".
+    if not expected_secret or not secrets.compare_digest(
+        secret.encode(), expected_secret.encode()
+    ):
         # 404 rather than 403: an attacker probing paths learns nothing about
         # whether this route exists.
         raise HTTPException(status_code=404, detail="Not found")
@@ -163,7 +170,9 @@ async def gumroad_webhook(secret: str, request: Request) -> MutationResponse:
         )
 
         expected_seller = os.environ.get("GUMROAD_SELLER_ID", "")
-        if payload.get("seller_id") != expected_seller:
+        # Fail closed: an unset env var must not turn into "" == "" matching
+        # an attacker's explicitly empty seller_id field.
+        if not expected_seller or payload.get("seller_id") != expected_seller:
             logger.warning("gumroad webhook: seller_id mismatch")
             await conn.execute(
                 "insert into webhook_logs (payload, success, error) "
@@ -175,34 +184,53 @@ async def gumroad_webhook(secret: str, request: Request) -> MutationResponse:
 
         email = payload.get("email")
         license_key = payload.get("license_key")
-        if not email or not license_key:
+        sale_id = payload.get("sale_id")
+        if not email or not license_key or not sale_id:
             await conn.execute(
                 "insert into webhook_logs (payload, success, error) "
                 "values ($1::jsonb, false, $2)",
                 json.dumps({"event": "missing_fields"}),
-                "Missing email or license_key",
+                "Missing email, license_key, or sale_id",
             )
-            return MutationResponse(success=False, error="Missing email or license_key")
+            return MutationResponse(
+                success=False, error="Missing email, license_key, or sale_id"
+            )
 
         full_name = payload.get("full_name") or email.split("@")[0]
 
-        # Upsert on sale_id makes Gumroad retries idempotent.
-        await conn.execute(
-            """
-            insert into licenses (email, full_name, country, license_key, sale_id)
-            values ($1, $2, $3, $4, $5)
-            on conflict (sale_id) do update
-            set email      = excluded.email,
-                full_name  = excluded.full_name,
-                country    = excluded.country,
-                license_key = excluded.license_key
-            """,
-            email,
-            full_name,
-            payload.get("country_code") or "Unknown",
-            license_key,
-            payload.get("sale_id"),
-        )
+        # Upsert on sale_id makes Gumroad retries idempotent. This only covers
+        # the sale_id arbiter, though: license_key carries its own unique
+        # constraint (and a normalize_license_key expression index), so a
+        # different sale reusing a license_key still violates a constraint
+        # that ON CONFLICT (sale_id) cannot catch. That is a genuine data
+        # conflict, not a transient error, but Gumroad only stops retrying on
+        # a 2xx, so it must not surface as a 500.
+        try:
+            await conn.execute(
+                """
+                insert into licenses (email, full_name, country, license_key, sale_id)
+                values ($1, $2, $3, $4, $5)
+                on conflict (sale_id) do update
+                set email      = excluded.email,
+                    full_name  = excluded.full_name,
+                    country    = excluded.country,
+                    license_key = excluded.license_key
+                """,
+                email,
+                full_name,
+                payload.get("country_code") or "Unknown",
+                license_key,
+                sale_id,
+            )
+        except asyncpg.UniqueViolationError as exc:
+            logger.warning("gumroad webhook: unique violation on upsert: %s", exc)
+            await conn.execute(
+                "insert into webhook_logs (payload, success, error) "
+                "values ($1::jsonb, false, $2)",
+                json.dumps({"event": "unique_violation"}),
+                str(exc),
+            )
+            return MutationResponse(success=False, error="License already exists")
 
     logger.info("gumroad webhook: licence created or updated")
     return MutationResponse(success=True, message="License created")

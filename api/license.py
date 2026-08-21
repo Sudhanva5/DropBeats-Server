@@ -175,10 +175,21 @@ def _client_key(request: Request) -> str:
     Spoofable, however, must not mean unbounded: anything that is not shaped
     like an IP address is discarded rather than turned into a dict key, so a
     caller cannot spend the process's memory a header at a time.
+
+    CF-Connecting-IP is preferred over X-Forwarded-For because the macOS app
+    reaches this service through a Cloudflare Worker (Jio blocks Railway, so
+    the app cannot call the origin directly). Cloudflare sets CF-Connecting-IP
+    on Worker subrequests itself and strips a Worker's own X-Forwarded-For, so
+    on the proxied path it is the ONLY header carrying the real client. Without
+    this branch every proxied user shares one bucket -- the exact collapse this
+    function was written to prevent, one layer up. X-Forwarded-For stays as the
+    fallback for any direct, non-proxied caller.
     """
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
+    for header in ("cf-connecting-ip", "x-forwarded-for"):
+        value = request.headers.get(header)
+        if not value:
+            continue
+        first = value.split(",")[0].strip()
         if _is_ip_shaped(first):
             return first
     peer = request.client.host if request.client else None

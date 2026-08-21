@@ -932,3 +932,61 @@ def test_health_reports_ready_when_pool_exists(migrated_conn):
     probe = _probe_main(DATABASE_URL=TEST_DSN, PROBE_INIT_POOL=TEST_DSN)
 
     assert probe["licensing"] == "ready"
+
+
+def _fake_request(headers: dict, peer: str | None = "203.0.113.9"):
+    """Minimal stand-in for a Starlette Request for _client_key tests."""
+    import types
+
+    from starlette.datastructures import Headers
+
+    client = types.SimpleNamespace(host=peer) if peer else None
+    return types.SimpleNamespace(headers=Headers(headers), client=client)
+
+
+def test_client_key_prefers_cf_connecting_ip_over_forwarded_for():
+    """On the proxied path CF-Connecting-IP is the only real client signal:
+    Cloudflare sets it on Worker subrequests and strips the Worker's own
+    X-Forwarded-For. Preferring XFF here would bucket every proxied user
+    together."""
+    import license as license_module
+
+    key = license_module._client_key(
+        _fake_request({
+            "cf-connecting-ip": "198.51.100.7",
+            "x-forwarded-for": "203.0.113.1",
+        })
+    )
+    assert key == "198.51.100.7"
+
+
+def test_client_key_accepts_ipv6_from_cloudflare():
+    """Cloudflare hands us IPv6 for a lot of mobile traffic, which is exactly
+    the Jio population this proxy exists for."""
+    import license as license_module
+
+    key = license_module._client_key(
+        _fake_request({"cf-connecting-ip": "2409:4091:900e:c211:6870:8fdd:1d72:b30"})
+    )
+    assert key == "2409:4091:900e:c211:6870:8fdd:1d72:b30"
+
+
+def test_client_key_falls_back_to_forwarded_for_when_not_proxied():
+    import license as license_module
+
+    key = license_module._client_key(_fake_request({"x-forwarded-for": "203.0.113.1"}))
+    assert key == "203.0.113.1"
+
+
+def test_client_key_ignores_malformed_cf_connecting_ip():
+    """A junk CF header must not become a bucket key, and must not shadow a
+    usable X-Forwarded-For."""
+    import license as license_module
+
+    key = license_module._client_key(
+        _fake_request({
+            "cf-connecting-ip": "not an ip at all",
+            "x-forwarded-for": "203.0.113.1",
+        })
+    )
+    assert key == "203.0.113.1"
